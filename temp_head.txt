@@ -1,0 +1,43 @@
+﻿# End of Day â€” IFC â†” Uniclass Mapping
+
+Date: 2025-09-06
+
+## Whatâ€™s Done
+
+- Database schema
+  - Added `sql/schema.sql` with versioned, typed edges: `ifc_class`, `uniclass_item`, `ifc_uniclass_map`, `mapping_flag`.
+  - Optional `pgvector` commented for future semantic matching; `pgcrypto` enabled for UUIDs.
+
+- Configuration
+  - Added `config/settings.example.yaml` defaulting to repo Samples:
+    - IFC JSON: `./Samples/ifc_classes_with_psets.json`
+    - Uniclass XLSX folder: `./Samples/uniclassTables`
+    - Thresholds and synonym hints included.
+
+- ETL pipeline (Python)
+  - Added `etl/etl_map.py` with CLI flags: `--load`, `--candidates`, `--export`.
+  - IFC input: parses `classes` map (uses `name/description/definition`).
+  - Uniclass input: auto-discovers `.xlsx` files in folder; robust header detection; CSV fallback supported.
+  - Facets normalized to uppercase (`EF, SS, PR, ...`) with filename/code inference.
+  - Candidate generation: lexical (RapidFuzz) + facet blocking + synonyms.
+  - Relation inference: `PR â†’ typical_of`, `SS â†’ equivalent/broader|part_of`, `EF â†’ equivalent/broader/narrower`.
+  - Auto-accept above threshold; writes edges with provenance/version.
+  - Exports viewer JSON aggregating edges per IFC class.
+
+- Quickstart documented (PowerShell)
+  - Venv + deps, apply schema, run ETL, outputs to `./output`.
+
+## Whatâ€™s Next
+
+- Config & run
+  - Copy `config/settings.example.yaml` â†’ `config/settings.yaml` and set DB credentials.
+  - Apply schema, install deps, run `--load`, then `--candidates`, then `--export`.
+
+- Review workflow
+  - Add â€œreview modeâ€ that emits only `output/candidates.csv` (no DB writes).
+  - Optional NocoDB (or lightweight UI) over `ifc_uniclass_map` for accept/reject/edit with filters.
+
+- Matching quality
+  - Add embeddings via `pgvector` for semantic candidates; blend cosine with lexical features.
+  - Expand and externalize synonym lists (domain curated).
+  - Tune relation inference rules per facet beyond `EF/SS/PR`.

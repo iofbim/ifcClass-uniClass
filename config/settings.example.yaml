@@ -1,0 +1,47 @@
+ # Note: etl/etl_map.py will use DATABASE_URL or POSTGRES_* from the environment if set.
+# This db_url acts as a fallback.
+db_url: postgresql://postgres:postgres@localhost:5432/iob_knowledge
+
+ifc:
+  schema_version: IFC4.3
+  # Path to Samples file you added
+  json_path: ./Samples/ifc_classes_with_psets.json
+
+uniclass:
+  revision: 2025-07
+  autodetect_revision: true
+  enforce_monotonic_revision: true
+  # Prefer this: auto-discover all .xlsx in folder
+  xlsx_dir: ./Samples/uniclassTables
+  # Or, alternatively, provide CSVs per facet (leave commented if not used)
+  # csv_paths:
+  #   EF: C:/path/to/Uniclass/EF.csv
+  #   Ss: C:/path/to/Uniclass/Ss.csv
+  #   Pr: C:/path/to/Uniclass/Pr.csv
+  #   # add more facets as needed: TE, PM, Ac, En, SL, Ro, Co
+
+output:
+  dir: ./output
+  viewer_json: ./output/viewer_mapping.json
+
+matching:
+  top_k: 5
+  auto_accept_threshold: 0.85
+  review_threshold: 0.6
+  # weight for embedding similarity in final score (0..1). 0 disables blending
+  embedding_weight: 0.4
+  # number of nearest neighbors to consider from embeddings per IFC item
+  embedding_top_k: 50
+  # basic synonym hints to boost lexical scoring
+  synonyms:
+    - ["hvac","mechanical services","building services"]
+    - ["curtain wall","glazed facade","curtainwall"]
+    - ["pipe","piping"]
+    - ["duct","ductwork"]
+
+embedding:
+  # Ollama endpoint and model used by --embed
+  endpoint: http://localhost:11434
+  model: nomic-embed-text
+  batch_size: 16
+  timeout_s: 30
