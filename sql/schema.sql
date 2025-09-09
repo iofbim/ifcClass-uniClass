@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS text_embedding (
   UNIQUE(entity_type, entity_id)
 );
 
+-- Nearest neighbor index to accelerate embedding searches (recommended)
+-- Note: requires pgvector 0.5.0+ and Postgres 14+. Adjust lists per data size.
+CREATE INDEX IF NOT EXISTS idx_te_uniclass_ivfflat
+  ON text_embedding USING ivfflat (embedding vector_cosine_ops)
+  WITH (lists = 100)
+  WHERE entity_type = 'uniclass';
+
 CREATE TABLE IF NOT EXISTS ifc_uniclass_map (
   map_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   ifc_id TEXT REFERENCES ifc_class(ifc_id) ON DELETE CASCADE,
@@ -55,14 +62,6 @@ CREATE TABLE IF NOT EXISTS ifc_uniclass_map (
   source_ifc_version TEXT,
   source_uniclass_revision TEXT,
   UNIQUE (ifc_id, code, relation_type, source_uniclass_revision)
-);
-
-CREATE TABLE IF NOT EXISTS mapping_flag (
-  map_id UUID REFERENCES ifc_uniclass_map(map_id) ON DELETE CASCADE,
-  flag TEXT,
-  note TEXT,
-  flagged_by TEXT,
-  flagged_at TIMESTAMPTZ DEFAULT now()
 );
 
 -- Helpful indexes

@@ -17,6 +17,8 @@ class Settings:
     db_url: str
     ifc_json: Path
     ifc_schema_version: str
+    # Whether to expand IFC text with parent-chain context
+    ifc_use_parent_context: bool
     uniclass_revision: str
     autodetect_uniclass_revision: bool
     enforce_monotonic_revision: bool
@@ -28,6 +30,8 @@ class Settings:
     auto_accept: float
     review_threshold: float
     synonyms: List[List[str]]
+    # Matching direction: 'ifc_to_uniclass' (default) or 'uniclass_to_ifc'
+    match_direction: str
     embed_model: str
     embed_endpoint: str
     embed_batch_size: int
@@ -86,6 +90,7 @@ def load_settings(path: Path) -> Settings:
         db_url=env_db_url or cfg["db_url"],
         ifc_json=Path(cfg["ifc"]["json_path"]).expanduser(),
         ifc_schema_version=cfg["ifc"]["schema_version"],
+        ifc_use_parent_context=bool(cfg.get("ifc", {}).get("use_parent_context", True)),
         uniclass_revision=str(cfg["uniclass"]["revision"]),
         autodetect_uniclass_revision=bool(cfg["uniclass"].get("autodetect_revision", True)),
         enforce_monotonic_revision=bool(cfg["uniclass"].get("enforce_monotonic_revision", True)),
@@ -97,6 +102,7 @@ def load_settings(path: Path) -> Settings:
         auto_accept=float(cfg["matching"].get("auto_accept_threshold", 0.85)),
         review_threshold=float(cfg["matching"].get("review_threshold", 0.6)),
         synonyms=syns,
+        match_direction=str((cfg.get("matching", {}) or {}).get("direction", "ifc_to_uniclass")),
         embed_model=str((cfg.get("embedding", {}) or {}).get("model", os.getenv("EMBED_MODEL", "nomic-embed-text"))),
         embed_endpoint=str((cfg.get("embedding", {}) or {}).get("endpoint", os.getenv("EMBED_ENDPOINT", "http://localhost:11434"))),
         embed_batch_size=int((cfg.get("embedding", {}) or {}).get("batch_size", os.getenv("EMBED_BATCH_SIZE", 16))),
@@ -263,17 +269,25 @@ def read_ifc_json(path: Path, schema_version: str) -> pd.DataFrame:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     rows = []
+    parent_map: Dict[str, Optional[str]] = {}
+    label_map: Dict[str, str] = {}
+    defn_map: Dict[str, str] = {}
     # Support structure: { "classes": { "IfcWall": { ... } } }
     classes = data.get("classes") if isinstance(data, dict) else None
     if isinstance(classes, dict):
         for ifc_id, item in classes.items():
             label = item.get("description") or item.get("name") or ifc_id
             desc = item.get("definition") or item.get("description") or ""
+            parent = item.get("parent")
+            parent_map[str(ifc_id)] = str(parent) if parent else None
+            label_map[str(ifc_id)] = str(label) if label is not None else str(ifc_id)
+            defn_map[str(ifc_id)] = str(desc) if desc is not None else ""
             rows.append({
                 "ifc_id": str(ifc_id),
                 "schema_version": schema_version,
                 "label": str(label) if label is not None else str(ifc_id),
                 "description": str(desc) if desc is not None else "",
+                "parent": str(parent) if parent else "",
             })
     elif isinstance(data, list):
         # Fallback: list of objects with id/name/description
@@ -286,8 +300,33 @@ def read_ifc_json(path: Path, schema_version: str) -> pd.DataFrame:
                 "schema_version": schema_version,
                 "label": item.get("label") or item.get("name") or str(ifc_id),
                 "description": item.get("description") or "",
+                "parent": str(item.get("parent") or ""),
             })
-    return pd.DataFrame(rows).drop_duplicates(subset=["ifc_id"]) if rows else pd.DataFrame(columns=["ifc_id","schema_version","label","description"]) 
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["ifc_id","schema_version","label","description","parent"]) 
+    if df.empty:
+        return df
+
+    # Build augmented text using parent chain context
+    def build_chain_text(node: str) -> str:
+        seen = set()
+        parts: List[str] = []
+        cur = node
+        depth = 0
+        while cur and cur not in seen and depth < 10:
+            seen.add(cur)
+            lbl = label_map.get(cur, cur)
+            dsc = defn_map.get(cur, "")
+            if dsc:
+                parts.append(f"{lbl}: {dsc}")
+            else:
+                parts.append(f"{lbl}")
+            cur = parent_map.get(cur)
+            depth += 1
+        # Most-specific first already; join
+        return ". ".join([p for p in parts if p]).strip()
+
+    df["aug_text"] = df["ifc_id"].map(lambda x: build_chain_text(str(x)))
+    return df.drop_duplicates(subset=["ifc_id"]) 
 
 
 def read_uniclass_csvs(csvs: Dict[str, Path], revision: str) -> pd.DataFrame:
@@ -333,13 +372,65 @@ def facet_from_filename(name: str) -> Optional[str]:
 
 
 def read_uniclass_xlsx_dir(dir_path: Path, revision: str) -> pd.DataFrame:
+    def _coerce_with_header_search(xlsx_path: Path) -> Optional[pd.DataFrame]:
+        """Read first sheet and try to locate the header row if the file has a title banner.
+
+        Strategy:
+        - First, try the straightforward read with inferred header.
+        - If expected columns not found, read with header=None, then scan the first 25 rows
+          for a row containing tokens like 'Uniclass Code' and 'Title'. Use that row as header.
+        """
+        try:
+            df = pd.read_excel(xlsx_path, sheet_name=0, dtype=str, engine="openpyxl")
+        except Exception:
+            df = pd.read_excel(xlsx_path, sheet_name=0, dtype=str)
+
+        def _find_cols(frame: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
+            cols = [c for c in frame.columns if isinstance(c, str)]
+            lower = {c.lower(): c for c in cols}
+            code_col = next((lower[k] for k in [
+                "uniclass code", "code", "item code", "pr code", "ef code", "ss code"
+            ] if k in lower), None)
+            title_col = next((lower[k] for k in [
+                "title", "item title", "name"
+            ] if k in lower), None)
+            return code_col, title_col
+
+        code_col, title_col = _find_cols(df)
+        if code_col and title_col:
+            return df
+
+        # Fallback: search header row
+        try:
+            raw = pd.read_excel(xlsx_path, sheet_name=0, header=None, dtype=str, engine="openpyxl")
+        except Exception:
+            raw = pd.read_excel(xlsx_path, sheet_name=0, header=None, dtype=str)
+        header_row = None
+        want_code = {"uniclass code", "code", "item code", "pr code", "ef code", "ss code"}
+        want_title = {"title", "item title", "name"}
+        max_scan = min(len(raw), 25)
+        for i in range(max_scan):
+            row_vals = [str(v).strip().lower() for v in list(raw.iloc[i].values)]
+            if any(v in want_code for v in row_vals) and any(v in want_title for v in row_vals):
+                header_row = i
+                break
+        if header_row is None:
+            return None
+        # Rebuild dataframe with detected header
+        new_cols = [str(v).strip() for v in raw.iloc[header_row].values]
+        data = raw.iloc[header_row + 1 :].copy()
+        data.columns = new_cols
+        code_col, title_col = _find_cols(data)
+        if code_col and title_col:
+            return data
+        return None
+
     frames = []
     for p in sorted(dir_path.glob("*.xlsx")):
         facet = facet_from_filename(p.stem) or ""
-        try:
-            df = pd.read_excel(p, sheet_name=0, dtype=str, engine="openpyxl")
-        except Exception:
-            df = pd.read_excel(p, sheet_name=0, dtype=str)
+        df = _coerce_with_header_search(p)
+        if df is None:
+            continue
         # Normalize columns
         cols = [c for c in df.columns if isinstance(c, str)]
         lower = {c.lower(): c for c in cols}
@@ -378,10 +469,11 @@ def upsert_ifc(conn: psycopg.Connection, df: pd.DataFrame):
             """
         )
         cols = ["ifc_id","schema_version","label","description"]
-        cur.copy(
-            "COPY tmp_ifc (ifc_id,schema_version,label,description) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)",
-            df[cols].to_csv(index=False, header=False),
-        )
+        csv_bytes = df[cols].to_csv(index=False, header=False).encode("utf-8")
+        with cur.copy(
+            "COPY tmp_ifc (ifc_id,schema_version,label,description) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)"
+        ) as cp:
+            cp.write(csv_bytes)
         cur.execute(
             """
             INSERT INTO ifc_class AS t (ifc_id,schema_version,label,description)
@@ -405,10 +497,11 @@ def upsert_uniclass(conn: psycopg.Connection, df: pd.DataFrame):
             """
         )
         cols = ["code","facet","title","description","revision"]
-        cur.copy(
-            "COPY tmp_uc (code,facet,title,description,revision) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)",
-            df[cols].to_csv(index=False, header=False),
-        )
+        csv_bytes = df[cols].to_csv(index=False, header=False).encode("utf-8")
+        with cur.copy(
+            "COPY tmp_uc (code,facet,title,description,revision) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)"
+        ) as cp:
+            cp.write(csv_bytes)
         cur.execute(
             """
             INSERT INTO uniclass_item AS u (code,facet,title,description,revision)
@@ -510,15 +603,28 @@ def _fetch_ifc_embedding(conn: psycopg.Connection, ifc_id: str) -> Optional[str]
     return str(val) if val is not None else None
 
 
-def _embedding_neighbors(conn: psycopg.Connection, qvec_text: str, limit: int) -> Dict[str, float]:
-    # Returns mapping code -> emb_score in [0,1]
+def _fetch_embedding(conn: psycopg.Connection, entity_type: str, entity_id: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT embedding::text FROM text_embedding WHERE entity_type=%s AND entity_id=%s",
+            (entity_type, entity_id),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    val = row[0] if not isinstance(row, dict) else row.get("embedding")
+    return str(val) if val is not None else None
+
+
+def _embedding_neighbors(conn: psycopg.Connection, target_entity_type: str, qvec_text: str, limit: int) -> Dict[str, float]:
+    # Returns mapping neighbor_id -> emb_score in [0,1] for the given target entity type
     sql = (
         "SELECT entity_id, 1 - (embedding <=> %s::vector) AS score "
-        "FROM text_embedding WHERE entity_type='uniclass' "
+        "FROM text_embedding WHERE entity_type=%s "
         "ORDER BY embedding <-> %s::vector LIMIT %s"
     )
     with conn.cursor() as cur:
-        cur.execute(sql, (qvec_text, qvec_text, limit))
+        cur.execute(sql, (qvec_text, target_entity_type, qvec_text, limit))
         rows = cur.fetchall()
     out: Dict[str, float] = {}
     for r in rows:
@@ -547,7 +653,7 @@ def generate_candidates_blended(
     }
 
     rows = []
-    alpha = float(embedding_weight)
+    base_alpha = float(embedding_weight)
     for _, r in ifc_df.iterrows():
         ifc_id = r["ifc_id"]
         desc = normalize_text(str(r.get("description", "")))
@@ -559,21 +665,40 @@ def generate_candidates_blended(
         if pool.empty:
             pool = uc_work
 
-        # Lexical scores
-        lex_scores: Dict[str, float] = {}
-        for _, u in pool.iterrows():
-            lex_scores[str(u["code"])] = float(score_pair(q, u["norm_title"]) * 1.0)
-
         # Embedding neighbor scores (if available)
         emb_scores: Dict[str, float] = {}
         qvec_text = _fetch_ifc_embedding(conn, ifc_id)
         if qvec_text:
-            emb_scores = _embedding_neighbors(conn, qvec_text, embedding_top_k)
+            emb_scores = _embedding_neighbors(conn, 'uniclass', qvec_text, embedding_top_k)
             # Optionally filter by facets
             if facets:
                 emb_scores = {c: s for c, s in emb_scores.items() if uc_info.get(c, ("", "", ""))[0] in facets}
 
-        # Merge candidates: union of codes present in either
+        # If we have embedding neighbors, restrict lexical scoring to those neighbors only.
+        # This avoids O(|pool|) lexical comparisons for every IFC class.
+        restrict_codes = set(emb_scores.keys()) if emb_scores else None
+
+        # Lexical scores
+        lex_scores: Dict[str, float] = {}
+        if restrict_codes is not None and len(restrict_codes) > 0:
+            # Score only the neighbor codes
+            for code in restrict_codes:
+                facet, title, _udesc = uc_info.get(code, ("", "", ""))
+                # Skip if facet-filtering removed it
+                if facets and facet not in facets:
+                    continue
+                # Look up normalized title from uc_work
+                norm_t = uc_work.loc[uc_work["code"] == code, "norm_title"].values
+                if len(norm_t) == 0:
+                    continue
+                lex_scores[code] = float(score_pair(q, norm_t[0]) * 1.0)
+        else:
+            # No embeddings found for this IFC; fall back to full lexical over the pool
+            for _, u in pool.iterrows():
+                lex_scores[str(u["code"])] = float(score_pair(q, u["norm_title"]) * 1.0)
+
+        # Blend scores; if no embeddings, act like alpha=0 (pure lexical)
+        alpha = base_alpha if emb_scores else 0.0
         codes = set(lex_scores.keys()) | set(emb_scores.keys())
         scored = []
         for code in codes:
@@ -590,6 +715,77 @@ def generate_candidates_blended(
                 "facet": facet,
                 "uniclass_title": title,
                 "uniclass_description": udesc,
+                "score": round(s, 4),
+            })
+    return pd.DataFrame(rows)
+
+
+def generate_candidates_uc2ifc_blended(
+    conn: psycopg.Connection,
+    ifc_df: pd.DataFrame,
+    uc_df: pd.DataFrame,
+    synonyms: List[List[str]],
+    top_k: int,
+    embedding_weight: float,
+    embedding_top_k: int,
+) -> pd.DataFrame:
+    # Prepare IFC searchable text (prefer augmented parent-chain text if present)
+    ifc_work = ifc_df.copy()
+    if "aug_text" in ifc_work.columns:
+        base_text = ifc_work["aug_text"].fillna("")
+    else:
+        base_text = ifc_work["description"].fillna("")
+    ifc_work["search_text"] = base_text.where(base_text.str.len() > 0, ifc_work["label"].fillna(""))
+    ifc_work["norm_text"] = ifc_work["search_text"].map(normalize_text).map(lambda s: expand_with_synonyms(s, synonyms))
+    ifc_info = {
+        str(r["ifc_id"]): (r.get("label", ""), r.get("description", ""))
+        for _, r in ifc_work.iterrows()
+    }
+
+    rows = []
+    base_alpha = float(embedding_weight)
+    for _, u in uc_df.iterrows():
+        code = str(u["code"])
+        facet = str(u.get("facet", ""))
+        title = str(u.get("title", ""))
+        q = expand_with_synonyms(normalize_text(title), synonyms)
+
+        # Embedding neighbors from Uniclass -> IFC
+        emb_scores: Dict[str, float] = {}
+        qvec_text = _fetch_embedding(conn, "uniclass", code)
+        if qvec_text:
+            emb_scores = _embedding_neighbors(conn, 'ifc', qvec_text, embedding_top_k)
+
+        # Lexical: restrict to embedding neighbors if present, else full IFC set
+        restrict_ids = set(emb_scores.keys()) if emb_scores else None
+        lex_scores: Dict[str, float] = {}
+        if restrict_ids:
+            for ifc_id in restrict_ids:
+                norm_t_vals = ifc_work.loc[ifc_work["ifc_id"] == ifc_id, "norm_text"].values
+                if len(norm_t_vals) == 0:
+                    continue
+                lex_scores[ifc_id] = float(score_pair(q, norm_t_vals[0]) * 1.0)
+        else:
+            for _, r in ifc_work.iterrows():
+                lex_scores[str(r["ifc_id"])] = float(score_pair(q, r["norm_text"]) * 1.0)
+
+        alpha = base_alpha if emb_scores else 0.0
+        ids = set(lex_scores.keys()) | set(emb_scores.keys())
+        scored = []
+        for ifc_id in ids:
+            lex = lex_scores.get(ifc_id, 0.0)
+            emb = emb_scores.get(ifc_id, 0.0)
+            final = (1 - alpha) * lex + alpha * emb
+            lbl, _desc = ifc_info.get(ifc_id, ("", ""))
+            scored.append((ifc_id, lbl, float(final)))
+        scored.sort(key=lambda x: x[2], reverse=True)
+        for ifc_id, _lbl, s in scored[:top_k]:
+            rows.append({
+                "ifc_id": ifc_id,
+                "code": code,
+                "facet": facet,
+                "uniclass_title": title,
+                "uniclass_description": u.get("description", ""),
                 "score": round(s, 4),
             })
     return pd.DataFrame(rows)
@@ -720,15 +916,19 @@ def main():
             upsert_uniclass(conn, uc_df)
 
         if args.embed:
-            # Prepare texts: IFC uses description/definition; Uniclass uses title only
+            # Prepare texts: IFC uses description/definition optionally augmented with parent chain; Uniclass uses title only
             ifc_items: List[Tuple[str, str]] = []
             for _, r in ifc_df.iterrows():
                 eid = str(r["ifc_id"]) if r.get("ifc_id") is not None else None
                 if not eid:
                     continue
-                desc = str(r.get('description','') or '').strip()
-                text = desc if desc else str(r.get('label','') or '').strip()
+                if s.ifc_use_parent_context and (r.get('aug_text') or ''):
+                    text = str(r.get('aug_text') or '').strip()
+                else:
+                    desc = str(r.get('description','') or '').strip()
+                    text = desc if desc else str(r.get('label','') or '').strip()
                 ifc_items.append((eid, text))
+
             uc_items: List[Tuple[str, str]] = []
             for _, r in uc_df.iterrows():
                 eid = str(r["code"]) if r.get("code") is not None else None
@@ -744,10 +944,18 @@ def main():
 
         if args.candidates:
             use_embed = s.embedding_weight and float(s.embedding_weight) > 0
-            if use_embed:
-                cands = generate_candidates_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k)
+            direction = (s.match_direction or 'ifc_to_uniclass').lower()
+            if direction == 'uniclass_to_ifc':
+                if use_embed:
+                    cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k)
+                else:
+                    # Lexical-only reverse direction using the same blended helper with alpha=0 via parameters
+                    cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, 0.0, s.embedding_top_k)
             else:
-                cands = generate_candidates(ifc_df, uc_df, s.synonyms, s.top_k)
+                if use_embed:
+                    cands = generate_candidates_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k)
+                else:
+                    cands = generate_candidates(ifc_df, uc_df, s.synonyms, s.top_k)
             cands_path = s.output_dir / "candidates.csv"
             cands.to_csv(cands_path, index=False)
             write_candidate_edges(conn, cands, s.ifc_schema_version, s.uniclass_revision, s.auto_accept)

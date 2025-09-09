@@ -6,7 +6,7 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 
 - Goal: Load IFC classes and Uniclass tables into Postgres, generate candidate mappings, and export a JSON for a viewer.
 - Core Script: `etl/etl_map.py` orchestrates loading, matching, and exporting via CLI flags.
-- Schema: `sql/schema.sql` defines tables (`ifc_class`, `uniclass_item`, `uniclass_item_revision`, `ifc_uniclass_map`, `mapping_flag`, `text_embedding`) and enables `pgcrypto` and `vector` (pgvector).
+- Schema: `sql/schema.sql` defines tables (`ifc_class`, `uniclass_item`, `uniclass_item_revision`, `ifc_uniclass_map`, `text_embedding`) and enables `pgcrypto` and `vector` (pgvector).
 
 ## Data Model
 
@@ -21,6 +21,7 @@ This repository establishes structured mappings between Uniclass 2015 classifica
   - Lexical: compares IFC description/definition (fallback to label) against Uniclass title only; blocks by facet heuristics.
   - Vector: optionally blends with pgvector similarity (IFC description/definition embeddings vs Uniclass title embeddings) controlled by `matching.embedding_weight`.
   - Auto-accepts above threshold with rationale.
+  - Direction: set `matching.direction` to `ifc_to_uniclass` (default) or `uniclass_to_ifc` to flip which side is queried against the other.
 - Embed (`--embed`): Generates embeddings for IFC/Uniclass text via Ollama and stores them in `text_embedding`.
 - Export (`--export`): Produces `output/viewer_mapping.json` aggregating accepted mappings for the viewer.
 
@@ -41,7 +42,7 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 
 ### Matching Rules
 
-- IFC side: uses class description/definition text; falls back to label if description is empty.
+- IFC side: uses class description/definition text; falls back to label if description is empty. When `ifc.use_parent_context: true` (default), embeddings and lexical scoring use an augmented text including the IFC class and its parent-chain labels/definitions.
 - Uniclass side: uses title only (no description/notes used).
 - Embeddings: built from the same signals (IFC description/definition vs Uniclass title).
 
@@ -61,8 +62,8 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 PowerShell quickstart (Windows):
 
 ```powershell
-# 1) Create and activate venv
-py -3.11 -m venv .venv
+# 1) Create and activate venv with latest python
+py -3 -m venv .venv
 . .\.venv\Scripts\Activate.ps1
 pip install pandas psycopg[binary] rapidfuzz pyyaml openpyxl requests
 
@@ -93,5 +94,6 @@ py etl/etl_map.py --config config/settings.yaml --export
 ```
 
 Tips:
+
 - Revision: Filenames like `..._v1_24.xlsx` auto-detect Uniclass revision; monotonic enforcement stops downgrades. Override in `config/settings.yaml`.
 - Embeddings: Default model `nomic-embed-text` (768 dims). If you change models, update `sql/schema.sql` (`vector(768)`) to match.
