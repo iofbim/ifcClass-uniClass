@@ -32,12 +32,29 @@ class Settings:
     synonyms: List[List[str]]
     # Matching direction: 'ifc_to_uniclass' (default) or 'uniclass_to_ifc'
     match_direction: str
+    # Optional facet-aware rules
+    matching_rules: Dict[str, dict]
+    # Optional convenience list of facets to skip entirely
+    skip_tables: List[str]
+    # Optional scoring boosts driven by IFC features
+    feature_boosts: Dict[str, float]
     embed_model: str
     embed_endpoint: str
     embed_batch_size: int
     embed_timeout_s: float
+    embed_expected_dim: Optional[int]
     embedding_weight: float
     embedding_top_k: int
+    # Anchor guidance from Uniclass IFC mapping columns
+    anchor_bonus: float
+    anchor_use_ancestors: bool
+    # LLM rerank settings (Ollama)
+    rerank_top_n: int
+    rerank_model: str
+    rerank_endpoint: str
+    rerank_temperature: float
+    rerank_max_tokens: int
+    rerank_fewshot_per_facet: int
 
 
 def _load_dotenv(dotenv_path: Optional[Path] = None) -> None:
@@ -86,6 +103,26 @@ def load_settings(path: Path) -> Settings:
         db = os.getenv("POSTGRES_DB")
         if user and pwd and db:
             env_db_url = f"postgresql://{user}:{pwd}@{host}:{port}/{db}"
+    # Build matching rules with optional skip_tables merged in (uppercase facets)
+    match_cfg = (cfg.get("matching", {}) or {})
+    base_rules = (match_cfg.get("rules", {}) or {}).copy()
+    skip_list = [str(x).upper() for x in (match_cfg.get("skip_tables", []) or [])]
+    for fac in skip_list:
+        r = (base_rules.get(fac) or {}).copy()
+        r["skip"] = True
+        base_rules[fac] = r
+
+    fb_cfg = (match_cfg.get("feature_boosts", {}) or {})
+    # Defaults are conservative multipliers (added to 1.0 later)
+    feature_boosts = {
+        "pr_predefined_type": float(fb_cfg.get("pr_predefined_type", 0.10)),
+        "pr_manufacturer_ps": float(fb_cfg.get("pr_manufacturer_ps", 0.10)),
+        "ss_group_system": float(fb_cfg.get("ss_group_system", 0.10)),
+        "type_bias": float(fb_cfg.get("type_bias", 0.05)),
+        "pset_count_scale": float(fb_cfg.get("pset_count_scale", 0.002)),  # +0.2 at 100 psets
+        "max_pset_boost": float(fb_cfg.get("max_pset_boost", 0.25)),
+    }
+
     return Settings(
         db_url=env_db_url or cfg["db_url"],
         ifc_json=Path(cfg["ifc"]["json_path"]).expanduser(),
@@ -102,14 +139,188 @@ def load_settings(path: Path) -> Settings:
         auto_accept=float(cfg["matching"].get("auto_accept_threshold", 0.85)),
         review_threshold=float(cfg["matching"].get("review_threshold", 0.6)),
         synonyms=syns,
-        match_direction=str((cfg.get("matching", {}) or {}).get("direction", "ifc_to_uniclass")),
+        match_direction=str(match_cfg.get("direction", "ifc_to_uniclass")),
+        matching_rules=base_rules,
+        skip_tables=skip_list,
+        feature_boosts=feature_boosts,
         embed_model=str((cfg.get("embedding", {}) or {}).get("model", os.getenv("EMBED_MODEL", "nomic-embed-text"))),
         embed_endpoint=str((cfg.get("embedding", {}) or {}).get("endpoint", os.getenv("EMBED_ENDPOINT", "http://localhost:11434"))),
         embed_batch_size=int((cfg.get("embedding", {}) or {}).get("batch_size", os.getenv("EMBED_BATCH_SIZE", 16))),
         embed_timeout_s=float((cfg.get("embedding", {}) or {}).get("timeout_s", os.getenv("EMBED_TIMEOUT_S", 30))),
+        embed_expected_dim=(lambda v: int(v) if (v is not None and str(v).strip() != "") else None)((cfg.get("embedding", {}) or {}).get("expected_dim", os.getenv("EMBED_EXPECTED_DIM", ""))),
         embedding_weight=float((cfg.get("matching", {}) or {}).get("embedding_weight", os.getenv("EMBEDDING_WEIGHT", 0.4))),
         embedding_top_k=int((cfg.get("matching", {}) or {}).get("embedding_top_k", os.getenv("EMBEDDING_TOP_K", 50))),
+        anchor_bonus=float((cfg.get("matching", {}) or {}).get("anchor_bonus", os.getenv("ANCHOR_BONUS", 0.25))),
+        anchor_use_ancestors=bool((cfg.get("matching", {}) or {}).get("anchor_use_ancestors", os.getenv("ANCHOR_USE_ANCESTORS", "true")).__str__().lower() in ("1","true","yes")),
+        rerank_top_n=int((cfg.get("rerank", {}) or {}).get("top_n", os.getenv("RERANK_TOP_N", 0))),
+        rerank_model=str((cfg.get("rerank", {}) or {}).get("model", os.getenv("RERANK_MODEL", "llama3.2:latest"))),
+        rerank_endpoint=str((cfg.get("rerank", {}) or {}).get("endpoint", os.getenv("RERANK_ENDPOINT", os.getenv("EMBED_ENDPOINT", "http://localhost:11434")))),
+        rerank_temperature=float((cfg.get("rerank", {}) or {}).get("temperature", os.getenv("RERANK_TEMPERATURE", 0))),
+        rerank_max_tokens=int((cfg.get("rerank", {}) or {}).get("max_tokens", os.getenv("RERANK_MAX_TOKENS", 512))),
+        rerank_fewshot_per_facet=int((cfg.get("rerank", {}) or {}).get("fewshot_per_facet", os.getenv("RERANK_FEWSHOT_PER_FACET", 3))),
+        rerank_timeout_s=float((cfg.get("rerank", {}) or {}).get("timeout_s", os.getenv("RERANK_TIMEOUT_S", 20))),
     )
+
+
+def _ollama_generate(prompt: str, model: str, endpoint: str, temperature: float = 0.0, max_tokens: int = 512, timeout_s: float = 60.0) -> Optional[str]:
+    try:
+        import requests
+    except Exception:
+        print("[rerank] requests is required. pip install requests")
+        return None
+    url = endpoint.rstrip("/") + "/api/generate"
+    try:
+        resp = requests.post(url, json={
+            "model": model,
+            "prompt": prompt,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
+            "format": "json",
+            "stream": False,
+        }, timeout=timeout_s)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("response") or data.get("text")
+    except Exception as e:
+        print(f"[rerank] ollama generate error: {e}")
+        return None
+
+
+def _collect_anchor_examples(uc_df: pd.DataFrame, fewshot_per_facet: int = 3) -> Dict[str, List[Tuple[str, str, List[str]]]]:
+    by_facet: Dict[str, List[Tuple[str, str, List[str]]]] = {}
+    if "ifc_mappings" not in uc_df.columns:
+        return by_facet
+    for _, r in uc_df.iterrows():
+        facet = str(r.get("facet", "")).upper()
+        code = str(r.get("code", ""))
+        title = str(r.get("title", ""))
+        maps_raw = str(r.get("ifc_mappings", "") or "")
+        ids = [m for m in maps_raw.split(";") if m]
+        if not ids:
+            continue
+        by_facet.setdefault(facet, []).append((code, title, ids))
+    # Trim per facet
+    for f in list(by_facet.keys()):
+        by_facet[f] = by_facet[f][:max(0, int(fewshot_per_facet))]
+    return by_facet
+
+
+def _format_rerank_prompt(direction: str, source_label: str, source_desc: str, source_facet: str, candidates: List[Tuple[str, str]], examples: Dict[str, List[Tuple[str, str, List[str]]]]) -> str:
+    # candidates: list of (id, label)
+    lines = []
+    lines.append("You are an expert mapping assistant for IFC and Uniclass.")
+    lines.append("Re-rank candidates by semantic suitability. Return ONLY JSON array: [{\"id\": \"...\", \"score\": 0..1}].")
+    lines.append("Higher score means better match.")
+    lines.append("")
+    # Few-shot using examples from same facet first, then any facet if none
+    shots = examples.get(source_facet.upper(), []) or next(iter(examples.values()), [])
+    if shots:
+        lines.append("Examples:")
+        for code, title, ifc_ids in shots:
+            if direction == 'uniclass_to_ifc':
+                lines.append(f"- Uniclass [{source_facet}] {code}: {title} -> IFC: {', '.join(ifc_ids)}")
+            else:
+                # For ifc_to_uniclass we invert description; still useful hints
+                lines.append(f"- IFC to Uniclass hint: IFC {', '.join(ifc_ids)} often maps to [{source_facet}] like '{title}'")
+        lines.append("")
+    lines.append(f"Task direction: {direction}")
+    lines.append(f"Source facet: {source_facet}")
+    lines.append(f"Source: {source_label}")
+    if source_desc:
+        lines.append(f"Source details: {source_desc}")
+    lines.append("Candidates:")
+    for cid, lbl in candidates:
+        lines.append(f"- id={cid} | {lbl}")
+    lines.append("")
+    lines.append("Return JSON only: [{\"id\": \"...\", \"score\": 0.xx}] with same ids.")
+    return "\n".join(lines)
+
+
+def _parse_rerank_json(text: str) -> List[Tuple[str, float]]:
+    import json, re
+    if not text:
+        return []
+    s = text.strip()
+    # Try to extract the first JSON array
+    m = re.search(r"\[(?:.|\n)*\]", s)
+    if m:
+        s = m.group(0)
+    try:
+        arr = json.loads(s)
+        out = []
+        for it in arr:
+            cid = str(it.get("id")) if isinstance(it, dict) else None
+            sc = float(it.get("score", 0.0)) if isinstance(it, dict) else 0.0
+            if cid:
+                out.append((cid, max(0.0, min(1.0, sc))))
+        return out
+    except Exception:
+        # Fallback: parse lines like id=..., score=...
+        out = []
+        for line in text.splitlines():
+            if "id=" in line:
+                cid = line.split("id=",1)[1].split()[0].strip().strip(',')
+                out.append((cid, 0.5))
+        return out
+
+
+def rerank_candidates_with_llm(
+    cands: pd.DataFrame,
+    ifc_df: pd.DataFrame,
+    uc_df: pd.DataFrame,
+    direction: str,
+    top_n: int,
+    model: str,
+    endpoint: str,
+    temperature: float,
+    max_tokens: int,
+    fewshot_per_facet: int,
+    timeout_s: float,
+) -> pd.DataFrame:
+    if top_n <= 0 or cands.empty:
+        return cands
+    # Build lookups
+    ifc_labels = {str(r["ifc_id"]): str(r.get("label", "")) for _, r in ifc_df.iterrows()}
+    uc_titles = {str(r["code"]): (str(r.get("title", "")), str(r.get("facet", ""))) for _, r in uc_df.iterrows()}
+    examples = _collect_anchor_examples(uc_df, fewshot_per_facet=fewshot_per_facet)
+    rows = []
+    if direction == 'uniclass_to_ifc':
+        for code, grp in cands.groupby("code"):
+            title, facet = uc_titles.get(str(code), ("", ""))
+            grp_sorted = grp.sort_values("score", ascending=False).head(top_n)
+            cand_list = [(str(r.ifc_id), ifc_labels.get(str(r.ifc_id), str(r.ifc_id))) for r in grp_sorted.itertuples(index=False)]
+            prompt = _format_rerank_prompt(direction, f"Uniclass {code}: {title}", "", facet, cand_list, examples)
+            resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
+            order = _parse_rerank_json(resp)
+            order_map = {cid: sc for cid, sc in order}
+            # Merge back, default to original order if missing
+            for r in grp.itertuples(index=False):
+                sc = order_map.get(str(r.ifc_id))
+                new_score = float(sc) if sc is not None else float(r.score)
+                rows.append({**r._asdict(), "score": max(0.0, min(1.0, new_score))})
+    else:
+        for ifc_id, grp in cands.groupby("ifc_id"):
+            lbl = ifc_labels.get(str(ifc_id), str(ifc_id))
+            # Use first facet/title for the prompt context
+            grp_sorted = grp.sort_values("score", ascending=False).head(top_n)
+            # For candidates use Uniclass code with title
+            cand_list = [(str(r.code), f"[{r.facet}] {r.uniclass_title}") for r in grp_sorted.itertuples(index=False)]
+            # NPC: facet context ambiguous; pick most common facet
+            try:
+                facet = grp_sorted["facet"].mode().iat[0]
+            except Exception:
+                facet = ""
+            prompt = _format_rerank_prompt(direction, f"IFC {ifc_id}: {lbl}", "", facet, cand_list, examples)
+            resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
+            order = _parse_rerank_json(resp)
+            order_map = {cid: sc for cid, sc in order}
+            for r in grp.itertuples(index=False):
+                sc = order_map.get(str(r.code))
+                new_score = float(sc) if sc is not None else float(r.score)
+                rows.append({**r._asdict(), "score": max(0.0, min(1.0, new_score))})
+    # Rebuild DataFrame
+    out = pd.DataFrame(rows)
+    # Ensure same column order if possible
+    return out[cands.columns] if set(out.columns) >= set(cands.columns) else out
 
 
 def _chunked(seq: List, n: int) -> List[List]:
@@ -278,7 +489,7 @@ def read_ifc_json(path: Path, schema_version: str) -> pd.DataFrame:
         for ifc_id, item in classes.items():
             label = item.get("description") or item.get("name") or ifc_id
             desc = item.get("definition") or item.get("description") or ""
-            parent = item.get("parent")
+            parent = item.get("parent") or item.get("baseClass")
             parent_map[str(ifc_id)] = str(parent) if parent else None
             label_map[str(ifc_id)] = str(label) if label is not None else str(ifc_id)
             defn_map[str(ifc_id)] = str(desc) if desc is not None else ""
@@ -288,6 +499,17 @@ def read_ifc_json(path: Path, schema_version: str) -> pd.DataFrame:
                 "label": str(label) if label is not None else str(ifc_id),
                 "description": str(desc) if desc is not None else "",
                 "parent": str(parent) if parent else "",
+                "is_abstract": bool(item.get("isAbstract", False)),
+                "role": str(item.get("role") or ""),
+                "is_type": bool(item.get("isType", False)),
+                "is_instance": bool(item.get("isInstance", False)),
+                "counterpart": str(item.get("counterpart") or ""),
+                "has_predefined_type": bool(item.get("predefinedType") is not None),
+                "pset_count": int(len(item.get("psets") or [])),
+                "has_manufacturer_ps": bool("Pset_ManufacturerTypeInformation" in (item.get("psets") or [])),
+                "base_class": str(item.get("baseClass") or ""),
+                "enum": str(item.get("enum") or ""),
+                "enum_value": str(item.get("enumValue") or ""),
             })
     elif isinstance(data, list):
         # Fallback: list of objects with id/name/description
@@ -300,9 +522,24 @@ def read_ifc_json(path: Path, schema_version: str) -> pd.DataFrame:
                 "schema_version": schema_version,
                 "label": item.get("label") or item.get("name") or str(ifc_id),
                 "description": item.get("description") or "",
-                "parent": str(item.get("parent") or ""),
+                "parent": str(item.get("parent") or item.get("baseClass") or ""),
+                "is_abstract": bool(item.get("isAbstract", False)),
+                "role": str(item.get("role") or ""),
+                "is_type": bool(item.get("isType", False)),
+                "is_instance": bool(item.get("isInstance", False)),
+                "counterpart": str(item.get("counterpart") or ""),
+                "has_predefined_type": bool(item.get("predefinedType") is not None),
+                "pset_count": int(len(item.get("psets") or [])),
+                "has_manufacturer_ps": bool("Pset_ManufacturerTypeInformation" in (item.get("psets") or [])),
+                "base_class": str(item.get("baseClass") or ""),
+                "enum": str(item.get("enum") or ""),
+                "enum_value": str(item.get("enumValue") or ""),
             })
-    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["ifc_id","schema_version","label","description","parent"]) 
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
+        "ifc_id","schema_version","label","description","parent","is_abstract",
+        "role","is_type","is_instance","counterpart","has_predefined_type","pset_count",
+        "has_manufacturer_ps","base_class","enum","enum_value"
+    ]) 
     if df.empty:
         return df
 
@@ -327,6 +564,114 @@ def read_ifc_json(path: Path, schema_version: str) -> pd.DataFrame:
 
     df["aug_text"] = df["ifc_id"].map(lambda x: build_chain_text(str(x)))
     return df.drop_duplicates(subset=["ifc_id"]) 
+
+
+def _build_ifc_ancestors_map(ifc_df: pd.DataFrame) -> Dict[str, List[str]]:
+    """Return mapping ifc_id -> list of ancestors including self, ordered most-specific to root."""
+    pmap = {str(r["ifc_id"]): (str(r.get("parent")) if r.get("parent") else None) for _, r in ifc_df.iterrows()}
+    cache: Dict[str, List[str]] = {}
+    def ancestors(n: Optional[str]) -> List[str]:
+        if not n:
+            return []
+        n = str(n)
+        if n in cache:
+            return cache[n]
+        visited = set()
+        chain: List[str] = []
+        cur = n
+        depth = 0
+        while cur and cur not in visited and depth < 50:
+            chain.append(cur)
+            visited.add(cur)
+            cur = pmap.get(cur)
+            depth += 1
+        cache[n] = chain
+        return chain
+    out: Dict[str, List[str]] = {}
+    for k in pmap.keys():
+        out[k] = ancestors(k)
+    return out
+
+
+def _facet_allows_ifc(
+    ifc_id: str,
+    facet: str,
+    rules: Dict[str, dict],
+    ancestors: Dict[str, List[str]],
+    is_abstract_map: Dict[str, bool],
+    flags_map: Optional[Dict[str, Dict[str, object]]] = None,
+) -> bool:
+    f = (facet or "").upper()
+    r = (rules or {}).get(f, {}) or {}
+    if not r:
+        return True
+    if r.get("skip"):
+        return False
+    if r.get("abstract_only") and not bool(is_abstract_map.get(ifc_id, False)):
+        return False
+    req = r.get("require_ifc_roots") or []
+    if req:
+        anc = ancestors.get(ifc_id, [ifc_id])
+        # Accept if any required root is in ancestor chain
+        if not any(root in anc for root in req):
+            return False
+    # Disqualifiers based on flags
+    if flags_map is not None:
+        flags = flags_map.get(str(ifc_id), {})
+        # Example: don't map spatial structures to PR (products)
+        if f == "PR" and bool(flags.get("is_spatial", False)):
+            return False
+    return True
+
+
+def _compute_ifc_flags(ifc_df: pd.DataFrame, ancestors: Dict[str, List[str]]) -> Dict[str, Dict[str, object]]:
+    roots_spatial = {"IfcSpatialElement", "IfcSpatialStructureElement", "IfcSite", "IfcBuilding", "IfcBuildingStorey", "IfcSpace"}
+    roots_product = {"IfcProduct", "IfcElement", "IfcDistributionElement"}
+    roots_process = {"IfcProcess", "IfcTask", "IfcProcedure"}
+    roots_group_system = {"IfcGroup", "IfcSystem"}
+    out: Dict[str, Dict[str, object]] = {}
+    for _, r in ifc_df.iterrows():
+        iid = str(r["ifc_id"]) 
+        anc = set(ancestors.get(iid, []))
+        is_spatial = any(root in anc for root in roots_spatial)
+        is_product = any(root in anc for root in roots_product)
+        is_process = any(root in anc for root in roots_process)
+        is_group_system = any(root in anc for root in roots_group_system)
+        d = {
+            "is_spatial": is_spatial,
+            "is_product": is_product,
+            "is_process": is_process,
+            "is_group_system": is_group_system,
+            "is_type": bool(r.get("is_type", False)),
+            "is_instance": bool(r.get("is_instance", False)),
+            "has_predefined_type": bool(r.get("has_predefined_type", False)),
+            "pset_count": int(r.get("pset_count", 0) or 0),
+            "has_manufacturer_ps": bool(r.get("has_manufacturer_ps", False)),
+            "role": str(r.get("role", "") or ""),
+        }
+        out[iid] = d
+    return out
+
+
+def _feature_multiplier(facet: str, flags: Dict[str, object], boosts: Dict[str, float]) -> float:
+    f = (facet or "").upper()
+    mult = 1.0
+    if f == "PR":
+        if bool(flags.get("has_predefined_type", False)):
+            mult += boosts.get("pr_predefined_type", 0.0)
+        if bool(flags.get("has_manufacturer_ps", False)):
+            mult += boosts.get("pr_manufacturer_ps", 0.0)
+    if f == "SS":
+        if bool(flags.get("is_group_system", False)):
+            mult += boosts.get("ss_group_system", 0.0)
+    # Type bias across PR/EF
+    if bool(flags.get("is_type", False)) and f in {"PR", "EF"}:
+        mult += boosts.get("type_bias", 0.0)
+    # Pset count small boost
+    pc = int(flags.get("pset_count", 0) or 0)
+    if pc > 0:
+        mult += min(pc * boosts.get("pset_count_scale", 0.0), boosts.get("max_pset_boost", 0.25))
+    return max(0.0, mult)
 
 
 def read_uniclass_csvs(csvs: Dict[str, Path], revision: str) -> pd.DataFrame:
@@ -438,20 +783,42 @@ def read_uniclass_xlsx_dir(dir_path: Path, revision: str) -> pd.DataFrame:
         title_col = next((lower[k] for k in ["title","item title","name"] if k in lower), None)
         if not code_col or not title_col:
             continue
+        # Attempt to harvest any IFC mapping hint columns (e.g., IFC 2x3, IFC 4x3)
+        ifc_cols = [c for c in cols if isinstance(c, str) and c and "ifc" in c.lower()]
+        ifc_map_series = None
+        if ifc_cols:
+            import re
+            def extract_ifc_ids(val: object) -> str:
+                s = str(val or "")
+                ids = re.findall(r"Ifc[A-Za-z0-9_]+", s)
+                return ";".join(sorted(set(ids))) if ids else ""
+            merged = []
+            for _, row in df[ifc_cols].iterrows():
+                parts = []
+                for c in ifc_cols:
+                    parts.append(extract_ifc_ids(row.get(c)))
+                uniq = sorted(set([p for p in ";".join(parts).split(";") if p]))
+                merged.append(";".join(uniq))
+            ifc_map_series = pd.Series(merged, index=df.index)
         fval = facet or ""
-        frames.append(pd.DataFrame({
+        base = {
             "code": df[code_col].astype(str).str.strip(),
             "facet": fval,
             "title": df[title_col].astype(str).str.strip(),
             "description": "",
             "revision": revision,
-        }))
+        }
+        if ifc_map_series is not None:
+            base["ifc_mappings"] = ifc_map_series
+        frames.append(pd.DataFrame(base))
     if not frames:
         return pd.DataFrame(columns=["code","facet","title","description","revision"]) 
     out = pd.concat(frames, ignore_index=True)
     # If facet was empty, try infer from code prefix before first underscore
     mask = out["facet"] == ""
     out.loc[mask, "facet"] = out.loc[mask, "code"].str.extract(r"^([A-Za-z]{1,2})_", expand=False).fillna("")
+    if "ifc_mappings" not in out.columns:
+        out["ifc_mappings"] = ""
     return out.drop_duplicates(subset=["code"]) 
 
 
@@ -557,14 +924,21 @@ def generate_candidates(
     uc_df: pd.DataFrame,
     synonyms: List[List[str]],
     top_k: int,
+    rules: Optional[Dict[str, dict]] = None,
 ) -> pd.DataFrame:
     uc_df = uc_df.copy()
     uc_df["norm_title"] = uc_df["title"].fillna("").map(normalize_text).map(lambda s: expand_with_synonyms(s, synonyms))
+    # Precompute IFC ancestors and abstract flags
+    ancestors = _build_ifc_ancestors_map(ifc_df)
+    is_abs = {str(r["ifc_id"]): bool(r.get("is_abstract", False)) for _, r in ifc_df.iterrows()}
 
     rows = []
+    flags_map = _compute_ifc_flags(ifc_df, ancestors)
     for _, r in ifc_df.iterrows():
         ifc_id = r["ifc_id"]
-        desc = normalize_text(str(r.get("description", "")))
+        # Prefer augmented text if available
+        base_text = str(r.get("aug_text") or r.get("description") or "")
+        desc = normalize_text(base_text)
         # Fallback to label if description/definition is empty
         if not desc:
             desc = normalize_text(str(r.get("label", "")))
@@ -575,8 +949,13 @@ def generate_candidates(
             pool = uc_df
         scores = []
         for _, u in pool.iterrows():
-            s = score_pair(q, u["norm_title"]) * 1.0
-            scores.append((u["code"], u["facet"], u["title"], u["description"], float(s)))
+            fac = str(u["facet"])
+            if not _facet_allows_ifc(str(ifc_id), fac, rules or {}, ancestors, is_abs, flags_map):
+                continue
+            s = score_pair(q, u["norm_title"]) * _feature_multiplier(fac, flags_map.get(str(ifc_id), {}), {
+                "pr_predefined_type": 0.10, "pr_manufacturer_ps": 0.10, "ss_group_system": 0.10, "type_bias": 0.05, "pset_count_scale": 0.002, "max_pset_boost": 0.25
+            })
+            scores.append((u["code"], fac, u["title"], u["description"], float(s)))
         scores.sort(key=lambda x: x[4], reverse=True)
         for code, facet, title, udesc, s in scores[:top_k]:
             rows.append({
@@ -617,11 +996,12 @@ def _fetch_embedding(conn: psycopg.Connection, entity_type: str, entity_id: str)
 
 
 def _embedding_neighbors(conn: psycopg.Connection, target_entity_type: str, qvec_text: str, limit: int) -> Dict[str, float]:
-    # Returns mapping neighbor_id -> emb_score in [0,1] for the given target entity type
+    # Returns mapping neighbor_id -> cosine similarity in [0,1] (clamped)
+    # Rank and score consistently with cosine distance operator (<=>)
     sql = (
         "SELECT entity_id, 1 - (embedding <=> %s::vector) AS score "
         "FROM text_embedding WHERE entity_type=%s "
-        "ORDER BY embedding <-> %s::vector LIMIT %s"
+        "ORDER BY embedding <=> %s::vector ASC LIMIT %s"
     )
     with conn.cursor() as cur:
         cur.execute(sql, (qvec_text, target_entity_type, qvec_text, limit))
@@ -642,21 +1022,35 @@ def generate_candidates_blended(
     top_k: int,
     embedding_weight: float,
     embedding_top_k: int,
+    anchor_bonus: float,
+    anchor_use_ancestors: bool,
+    rules: Optional[Dict[str, dict]] = None,
 ) -> pd.DataFrame:
     # Precompute lex features on uc_df
     uc_work = uc_df.copy()
     uc_work["norm_title"] = uc_work["title"].fillna("").map(normalize_text).map(lambda s: expand_with_synonyms(s, synonyms))
-    # Dict for quick lookup by code
-    uc_info = {
-        str(r["code"]): (r["facet"], r["title"], r.get("description", ""))
-        for _, r in uc_work.iterrows()
-    }
+    # Dict for quick lookup by code (string keys)
+    uc_info = {}
+    for _, r in uc_work.iterrows():
+        code = str(r["code"])
+        facet = r["facet"]
+        title = r["title"]
+        desc = r.get("description", "")
+        maps_raw = str(r.get("ifc_mappings", "") or "")
+        map_set = set([m for m in maps_raw.split(";") if m])
+        uc_info[code] = (facet, title, desc, map_set)
+    # Fast lookup for normalized titles by code, avoid .loc in tight loops
+    code_to_norm = pd.Series(uc_work["norm_title"].values, index=uc_work["code"].astype(str)).to_dict()
 
     rows = []
+    ancestors = _build_ifc_ancestors_map(ifc_df)
+    is_abs = {str(r["ifc_id"]): bool(r.get("is_abstract", False)) for _, r in ifc_df.iterrows()}
+    flags_map = _compute_ifc_flags(ifc_df, ancestors)
     base_alpha = float(embedding_weight)
     for _, r in ifc_df.iterrows():
         ifc_id = r["ifc_id"]
-        desc = normalize_text(str(r.get("description", "")))
+        base_text = str(r.get("aug_text") or r.get("description") or "")
+        desc = normalize_text(base_text)
         if not desc:
             desc = normalize_text(str(r.get("label", "")))
         q = expand_with_synonyms(f"{desc}".strip(), synonyms)
@@ -683,18 +1077,24 @@ def generate_candidates_blended(
         if restrict_codes is not None and len(restrict_codes) > 0:
             # Score only the neighbor codes
             for code in restrict_codes:
-                facet, title, _udesc = uc_info.get(code, ("", "", ""))
+                facet, title, _udesc, _maps = uc_info.get(code, ("", "", "", set()))
                 # Skip if facet-filtering removed it
                 if facets and facet not in facets:
                     continue
-                # Look up normalized title from uc_work
-                norm_t = uc_work.loc[uc_work["code"] == code, "norm_title"].values
-                if len(norm_t) == 0:
+                # Rules: ensure this IFC is allowed for the facet
+                if not _facet_allows_ifc(str(ifc_id), str(facet), rules or {}, ancestors, is_abs, flags_map):
                     continue
-                lex_scores[code] = float(score_pair(q, norm_t[0]) * 1.0)
+                # Use precomputed normalized title
+                norm_t = code_to_norm.get(str(code))
+                if not norm_t:
+                    continue
+                lex_scores[code] = float(score_pair(q, norm_t) * 1.0)
         else:
             # No embeddings found for this IFC; fall back to full lexical over the pool
             for _, u in pool.iterrows():
+                fac = str(u["facet"])
+                if not _facet_allows_ifc(str(ifc_id), fac, rules or {}, ancestors, is_abs, flags_map):
+                    continue
                 lex_scores[str(u["code"])] = float(score_pair(q, u["norm_title"]) * 1.0)
 
         # Blend scores; if no embeddings, act like alpha=0 (pure lexical)
@@ -704,9 +1104,23 @@ def generate_candidates_blended(
         for code in codes:
             lex = lex_scores.get(code, 0.0)
             emb = emb_scores.get(code, 0.0)
-            final = (1 - alpha) * lex + alpha * emb
-            facet, title, udesc = uc_info.get(code, ("", "", ""))
-            scored.append((code, facet, title, udesc, float(final)))
+            # Retrieve Uniclass facet/title for this code first
+            ufacet, title, udesc, umaps = uc_info.get(code, ("", "", "", set()))
+            # Apply feature multiplier as post-combination adjuster
+            mult = _feature_multiplier(ufacet, flags_map.get(str(ifc_id), {}), {
+                "pr_predefined_type": 0.10, "pr_manufacturer_ps": 0.10, "ss_group_system": 0.10, "type_bias": 0.05, "pset_count_scale": 0.002, "max_pset_boost": 0.25
+            })
+            final = ((1 - alpha) * lex + alpha * emb) * mult
+            # Anchor guidance: boost if Uniclass row maps to this IFC (or its ancestors if enabled)
+            if umaps:
+                if anchor_use_ancestors:
+                    anc = set(ancestors.get(str(ifc_id), [])) | {str(ifc_id)}
+                    if any(m in anc for m in umaps):
+                        final = min(1.0, final + anchor_bonus)
+                else:
+                    if str(ifc_id) in umaps:
+                        final = min(1.0, final + anchor_bonus)
+            scored.append((code, ufacet, title, udesc, float(final)))
         scored.sort(key=lambda x: x[4], reverse=True)
         for code, facet, title, udesc, s in scored[:top_k]:
             rows.append({
@@ -728,6 +1142,9 @@ def generate_candidates_uc2ifc_blended(
     top_k: int,
     embedding_weight: float,
     embedding_top_k: int,
+    anchor_bonus: float,
+    anchor_use_ancestors: bool,
+    rules: Optional[Dict[str, dict]] = None,
 ) -> pd.DataFrame:
     # Prepare IFC searchable text (prefer augmented parent-chain text if present)
     ifc_work = ifc_df.copy()
@@ -741,6 +1158,11 @@ def generate_candidates_uc2ifc_blended(
         str(r["ifc_id"]): (r.get("label", ""), r.get("description", ""))
         for _, r in ifc_work.iterrows()
     }
+    # Fast lookup for normalized IFC text by id to avoid .loc
+    ifc_id_to_norm = pd.Series(ifc_work["norm_text"].values, index=ifc_work["ifc_id"].astype(str)).to_dict()
+    ancestors = _build_ifc_ancestors_map(ifc_work)
+    is_abs = {str(r["ifc_id"]): bool(r.get("is_abstract", False)) for _, r in ifc_work.iterrows()}
+    flags_map = _compute_ifc_flags(ifc_work, ancestors)
 
     rows = []
     base_alpha = float(embedding_weight)
@@ -749,6 +1171,11 @@ def generate_candidates_uc2ifc_blended(
         facet = str(u.get("facet", ""))
         title = str(u.get("title", ""))
         q = expand_with_synonyms(normalize_text(title), synonyms)
+        umaps = set([m for m in str(u.get("ifc_mappings", "") or "").split(";") if m])
+
+        # If facet is globally skipped, then there will be no allowed IFCs
+        if (rules or {}).get(facet.upper(), {}).get("skip"):
+            continue
 
         # Embedding neighbors from Uniclass -> IFC
         emb_scores: Dict[str, float] = {}
@@ -761,13 +1188,18 @@ def generate_candidates_uc2ifc_blended(
         lex_scores: Dict[str, float] = {}
         if restrict_ids:
             for ifc_id in restrict_ids:
-                norm_t_vals = ifc_work.loc[ifc_work["ifc_id"] == ifc_id, "norm_text"].values
-                if len(norm_t_vals) == 0:
+                if not _facet_allows_ifc(ifc_id, facet, rules or {}, ancestors, is_abs, flags_map):
                     continue
-                lex_scores[ifc_id] = float(score_pair(q, norm_t_vals[0]) * 1.0)
+                norm_t = ifc_id_to_norm.get(str(ifc_id))
+                if not norm_t:
+                    continue
+                lex_scores[ifc_id] = float(score_pair(q, norm_t) * 1.0)
         else:
             for _, r in ifc_work.iterrows():
-                lex_scores[str(r["ifc_id"])] = float(score_pair(q, r["norm_text"]) * 1.0)
+                ifc_id = str(r["ifc_id"])
+                if not _facet_allows_ifc(ifc_id, facet, rules or {}, ancestors, is_abs, flags_map):
+                    continue
+                lex_scores[ifc_id] = float(score_pair(q, r["norm_text"]) * 1.0)
 
         alpha = base_alpha if emb_scores else 0.0
         ids = set(lex_scores.keys()) | set(emb_scores.keys())
@@ -775,7 +1207,18 @@ def generate_candidates_uc2ifc_blended(
         for ifc_id in ids:
             lex = lex_scores.get(ifc_id, 0.0)
             emb = emb_scores.get(ifc_id, 0.0)
-            final = (1 - alpha) * lex + alpha * emb
+            mult = _feature_multiplier(facet, flags_map.get(str(ifc_id), {}), {
+                "pr_predefined_type": 0.10, "pr_manufacturer_ps": 0.10, "ss_group_system": 0.10, "type_bias": 0.05, "pset_count_scale": 0.002, "max_pset_boost": 0.25
+            })
+            final = ((1 - alpha) * lex + alpha * emb) * mult
+            if umaps:
+                if anchor_use_ancestors:
+                    anc = set(ancestors.get(str(ifc_id), [])) | {str(ifc_id)}
+                    if any(m in anc for m in umaps):
+                        final = min(1.0, final + anchor_bonus)
+                else:
+                    if str(ifc_id) in umaps:
+                        final = min(1.0, final + anchor_bonus)
             lbl, _desc = ifc_info.get(ifc_id, ("", ""))
             scored.append((ifc_id, lbl, float(final)))
         scored.sort(key=lambda x: x[2], reverse=True)
@@ -818,8 +1261,14 @@ def write_candidate_edges(
         rel = infer_relation_type(r["ifc_id"], r["facet"], r["score"])
         if r["score"] < auto_accept:
             continue
+        # Clamp confidence into [0.0, 1.0] to satisfy DB constraint
+        conf = float(r["score"])
+        if conf < 0.0:
+            conf = 0.0
+        elif conf > 1.0:
+            conf = 1.0
         payload.append((
-            r["ifc_id"], r["code"], rel, float(r["score"]),
+            r["ifc_id"], r["code"], rel, conf,
             f"auto-accepted by lexical heuristic top-k; facet={r['facet']}",
             source_ifc_version, source_uniclass_revision
         ))
@@ -864,12 +1313,60 @@ def export_viewer_json(conn: psycopg.Connection, out_path: Path):
         json.dump(grouped, f, ensure_ascii=False, indent=2)
 
 
+def reset_mappings(
+    conn: psycopg.Connection,
+    uniclass_revision: Optional[str] = None,
+    facets: Optional[List[str]] = None,
+) -> int:
+    """Delete existing mappings, scoped by Uniclass revision and optional facets.
+
+    - If uniclass_revision is provided, deletes only rows with matching
+      source_uniclass_revision.
+    - If facets are provided, deletes only rows whose Uniclass code belongs to
+      those facets (via join to uniclass_item).
+    Returns number of deleted rows (best-effort estimate).
+    """
+    conds = []
+    params: List[object] = []
+    if uniclass_revision:
+        conds.append("m.source_uniclass_revision = %s")
+        params.append(uniclass_revision)
+    facet_list: List[str] = []
+    if facets:
+        facet_list = [str(f).upper().strip() for f in facets if str(f).strip()]
+    deleted = 0
+    with conn.cursor() as cur:
+        if facet_list:
+            where = (" AND ".join(conds)) if conds else "TRUE"
+            placeholders = ",".join(["%s"] * len(facet_list))
+            sql = f"""
+                DELETE FROM ifc_uniclass_map m
+                USING uniclass_item u
+                WHERE u.code = m.code
+                  AND u.facet = ANY (ARRAY[{placeholders}])
+                  AND {where}
+            """
+            cur.execute(sql, [*facet_list, *params])
+        else:
+            where = (" AND ".join(conds)) if conds else "TRUE"
+            sql = f"DELETE FROM ifc_uniclass_map m WHERE {where}"
+            cur.execute(sql, params)
+        # Best-effort rowcount
+        try:
+            deleted = cur.rowcount or 0
+        except Exception:
+            deleted = 0
+    return int(deleted)
+
 def main():
     ap = argparse.ArgumentParser(description="IFC ↔ Uniclass ETL and candidate mapping")
     ap.add_argument("--config", required=True, help="Path to YAML settings")
     ap.add_argument("--load", action="store_true", help="Load IFC and Uniclass into DB")
     ap.add_argument("--candidates", action="store_true", help="Generate top-k candidate links and auto-accept above threshold")
     ap.add_argument("--export", action="store_true", help="Export viewer JSON from accepted mappings")
+    # Optional maintenance flags
+    ap.add_argument("--reset-mappings", action="store_true", help="Delete existing mappings for current Uniclass revision (optionally filter by --reset-facets)")
+    ap.add_argument("--reset-facets", type=str, default="", help="Comma-separated Uniclass facets to reset (e.g., PR,SS)")
     ap.add_argument("--embed", action="store_true", help="Generate embeddings via Ollama and store in DB")
     args = ap.parse_args()
 
@@ -915,18 +1412,45 @@ def main():
             upsert_ifc(conn, ifc_df)
             upsert_uniclass(conn, uc_df)
 
+        # Optional cleanup before generating candidates
+        if args.reset_mappings:
+            facets = [x.strip() for x in (args.reset_facets or "").split(",") if x.strip()]
+            n = reset_mappings(conn, uniclass_revision=s.uniclass_revision, facets=facets)
+            print(f"[cleanup] Deleted {n} mapping rows for revision '{s.uniclass_revision}'" + (f" and facets {facets}" if facets else ""))
+
         if args.embed:
-            # Prepare texts: IFC uses description/definition optionally augmented with parent chain; Uniclass uses title only
+            # Prepare texts: IFC uses description/definition optionally augmented with parent chain; Uniclass uses enriched title/context
             ifc_items: List[Tuple[str, str]] = []
+            # Prepare flags to append concise feature hints into embedding text
+            anc_map = _build_ifc_ancestors_map(ifc_df)
+            flags_map = _compute_ifc_flags(ifc_df, anc_map)
             for _, r in ifc_df.iterrows():
                 eid = str(r["ifc_id"]) if r.get("ifc_id") is not None else None
                 if not eid:
                     continue
                 if s.ifc_use_parent_context and (r.get('aug_text') or ''):
-                    text = str(r.get('aug_text') or '').strip()
+                    base = str(r.get('aug_text') or '').strip()
                 else:
                     desc = str(r.get('description','') or '').strip()
-                    text = desc if desc else str(r.get('label','') or '').strip()
+                    base = desc if desc else str(r.get('label','') or '').strip()
+                # Append compact feature hints
+                fl = flags_map.get(eid, {})
+                feat_bits = []
+                if fl.get('is_type'): feat_bits.append('role:Type')
+                if fl.get('is_instance'): feat_bits.append('role:Instance')
+                if fl.get('is_product'): feat_bits.append('kind:Product')
+                if fl.get('is_spatial'): feat_bits.append('kind:Spatial')
+                if fl.get('is_process'): feat_bits.append('kind:Process')
+                if fl.get('is_group_system'): feat_bits.append('kind:System')
+                if fl.get('has_predefined_type'): feat_bits.append('predefinedType')
+                pc = int(fl.get('pset_count', 0) or 0)
+                if pc:
+                    feat_bits.append(f'psets:{pc}')
+                if bool(fl.get('has_manufacturer_ps', False)):
+                    feat_bits.append('pset:ManufacturerTypeInformation')
+                extra = (" | " + ", ".join(feat_bits)) if feat_bits else ""
+                # Include the IFC identifier token to help matching (e.g., 'IfcAirTerminalBox')
+                text = (f"{eid}. " + base + extra).strip()
                 ifc_items.append((eid, text))
 
             uc_items: List[Tuple[str, str]] = []
@@ -934,12 +1458,17 @@ def main():
                 eid = str(r["code"]) if r.get("code") is not None else None
                 if not eid:
                     continue
-                text = f"{str(r.get('title','') or '')}".strip()
+                title = str(r.get('title','') or '').strip()
+                facet = str(r.get('facet','') or '').upper()
+                # Tokenize code to expose hierarchy (e.g., 'Pr 20 93' instead of 'Pr_20_93')
+                code_tokens = eid.replace('_', ' ')
+                # Build enriched text with facet and code context to improve semantic alignment
+                text = f"[{facet}] {code_tokens}: {title}"
                 uc_items.append((eid, text))
 
             print(f"[embed] Generating embeddings using model '{s.embed_model}' at {s.embed_endpoint}")
-            n_ifc = generate_and_store_embeddings(conn, "ifc", ifc_items, s.embed_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=768)
-            n_uc = generate_and_store_embeddings(conn, "uniclass", uc_items, s.embed_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=768)
+            n_ifc = generate_and_store_embeddings(conn, "ifc", ifc_items, s.embed_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=s.embed_expected_dim)
+            n_uc = generate_and_store_embeddings(conn, "uniclass", uc_items, s.embed_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=s.embed_expected_dim)
             print(f"[embed] Upserted {n_ifc} IFC and {n_uc} Uniclass embeddings")
 
         if args.candidates:
@@ -947,15 +1476,44 @@ def main():
             direction = (s.match_direction or 'ifc_to_uniclass').lower()
             if direction == 'uniclass_to_ifc':
                 if use_embed:
-                    cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k)
+                    cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
                 else:
                     # Lexical-only reverse direction using the same blended helper with alpha=0 via parameters
-                    cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, 0.0, s.embedding_top_k)
+                    cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, 0.0, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
             else:
                 if use_embed:
-                    cands = generate_candidates_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k)
+                    cands = generate_candidates_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
                 else:
-                    cands = generate_candidates(ifc_df, uc_df, s.synonyms, s.top_k)
+                    cands = generate_candidates(ifc_df, uc_df, s.synonyms, s.top_k, s.matching_rules)
+
+            # Optional LLM rerank
+            if int(s.rerank_top_n or 0) > 0:
+                try:
+                    # Quick health check to avoid long hangs
+                    import requests  # noqa: F401
+                    ok = True
+                except Exception:
+                    ok = False
+                if not ok:
+                    print("[rerank] requests not available; skipping rerank.")
+                else:
+                    # Proceed with rerank, per-call timeout is enforced
+                    try:
+                        cands = rerank_candidates_with_llm(
+                            cands,
+                            ifc_df,
+                            uc_df,
+                            direction=direction,
+                            top_n=int(s.rerank_top_n),
+                            model=s.rerank_model,
+                            endpoint=s.rerank_endpoint,
+                            temperature=float(s.rerank_temperature),
+                            max_tokens=int(s.rerank_max_tokens),
+                            fewshot_per_facet=int(s.rerank_fewshot_per_facet),
+                            timeout_s=float(s.rerank_timeout_s),
+                        )
+                    except Exception as e:
+                        print(f"[rerank] skipped due to error: {e}")
             cands_path = s.output_dir / "candidates.csv"
             cands.to_csv(cands_path, index=False)
             write_candidate_edges(conn, cands, s.ifc_schema_version, s.uniclass_revision, s.auto_accept)

@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS text_embedding (
   id SERIAL PRIMARY KEY,
   entity_type TEXT NOT NULL CHECK (entity_type IN ('ifc','uniclass')),
   entity_id TEXT NOT NULL,
-  embedding vector(768),
+  embedding vector(1024),
   UNIQUE(entity_type, entity_id)
 );
 

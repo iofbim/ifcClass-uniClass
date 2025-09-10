@@ -4,8 +4,8 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 
 ## Overview
 
-- Goal: Load IFC classes and Uniclass tables into Postgres, generate candidate mappings, and export a JSON for a viewer.
-- Core Script: `etl/etl_map.py` orchestrates loading, matching, and exporting via CLI flags.
+- Goal: Load IFC classes and Uniclass tables into Postgres, generate candidate mappings with lexical + vector similarity, optionally re-rank with a local LLM, and export a JSON for a viewer.
+- Core: `etl/etl_map.py` orchestrates loading, embeddings, candidate generation, optional LLM re-rank, and export via CLI flags.
 - Schema: `sql/schema.sql` defines tables (`ifc_class`, `uniclass_item`, `uniclass_item_revision`, `ifc_uniclass_map`, `text_embedding`) and enables `pgcrypto` and `vector` (pgvector).
 
 ## Data Model
@@ -16,14 +16,19 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 
 ## ETL Flow
 
-- Load (`--load`): Inserts/updates IFC classes and Uniclass items in bulk using psycopg copy/UPSERT.
+- Load (`--load`): Upserts IFC classes and Uniclass items.
+- Embed (`--embed`): Generates embeddings with Ollama and stores in `text_embedding`.
+  - IFC text: identifier + description/definition with parent-chain context (optional), plus compact feature hints (e.g., role, kind, psets).
+  - Uniclass text: enriched with `[FACET] Code tokens: Title` (e.g., `[PR] Pr 20 93: Unit structure and general products`).
+  - Recommended embed model: `mxbai-embed-large` (1024‑dim); set `embedding.expected_dim: 1024`.
 - Candidates (`--candidates`):
-  - Lexical: compares IFC description/definition (fallback to label) against Uniclass title only; blocks by facet heuristics.
-  - Vector: optionally blends with pgvector similarity (IFC description/definition embeddings vs Uniclass title embeddings) controlled by `matching.embedding_weight`.
-  - Auto-accepts above threshold with rationale.
-  - Direction: set `matching.direction` to `ifc_to_uniclass` (default) or `uniclass_to_ifc` to flip which side is queried against the other.
-- Embed (`--embed`): Generates embeddings for IFC/Uniclass text via Ollama and stores them in `text_embedding`.
-- Export (`--export`): Produces `output/viewer_mapping.json` aggregating accepted mappings for the viewer.
+  - Lexical: fuzzy match between normalized IFC text and Uniclass titles, filtered by facet rules.
+  - Vector blend: nearest neighbors via pgvector using cosine distance (consistent rank + score), blended by `matching.embedding_weight`.
+  - Anchor guidance: if Uniclass XLSX includes IFC mapping columns (e.g., “IFC 4x3”), extracted `ifc_mappings` boost those IFCs (or ancestors) by `matching.anchor_bonus`.
+  - Direction: `matching.direction` `ifc_to_uniclass` (default) or `uniclass_to_ifc` (ensures every Uniclass gets candidates from IFC).
+  - Auto-accept: rows above `matching.auto_accept_threshold` are written to `ifc_uniclass_map` (confidence clamped to [0,1]).
+- Re-rank (optional): If `rerank.top_n > 0`, per-item top‑N are re-scored by a local LLM (Ollama) using few-shot examples from the extracted anchors per facet.
+- Export (`--export`): Writes `output/viewer_mapping.json` summarizing accepted mappings.
 
 ## Configuration
 
@@ -40,22 +45,40 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 - `uniclass.enforce_monotonic_revision` (default true): Prevents loading if the incoming revision is not greater than the latest stored.
 - History: Each load writes snapshots to `uniclass_item_revision (code, revision, ...)` while `uniclass_item` holds the latest per code.
 
-### Matching Rules
+### Matching, Anchors, Rerank
 
-- IFC side: uses class description/definition text; falls back to label if description is empty. When `ifc.use_parent_context: true` (default), embeddings and lexical scoring use an augmented text including the IFC class and its parent-chain labels/definitions.
-- Uniclass side: uses title only (no description/notes used).
-- Embeddings: built from the same signals (IFC description/definition vs Uniclass title).
+- Facet rules: control eligibility with `matching.rules`, and disable facets with `matching.skip_tables`.
+- Feature boosts: `_feature_multiplier` favors relevant IFCs (type bias, predefined type, pset count, group/system, etc.).
+- Anchors from Uniclass: XLSX loader extracts IFC IDs from any “IFC …” columns into `ifc_mappings`; candidate scoring adds `matching.anchor_bonus` (optionally including ancestors) to those pairs.
+- Rerank with Ollama: `rerank.top_n`, `rerank.model`, `rerank.temperature`, `rerank.max_tokens`, `rerank.fewshot_per_facet`.
+  - Use a concise instruct model (e.g., `llama3.2:latest`, `llama3.1:8b-instruct`, `dolphin3:latest`).
+  - Few-shot examples are drawn from `ifc_mappings` for the same facet (if present).
 
 ## Dependencies
 
 - Python: `pandas`, `psycopg[binary]`, `rapidfuzz`, `pyyaml`, `openpyxl`, `requests` (for `--embed`)
 - Postgres: 14+ with `pgcrypto` and `pgvector` (extension `vector` must be installed on the server). The schema creates both extensions if available.
-- Optional (embeddings): [Ollama](https://ollama.com) with a local embedding model (default: `nomic-embed-text`, 768 dims).
+- Optional (embeddings): [Ollama](https://ollama.com) with a local embedding model. Recommended: `mxbai-embed-large` (1024 dims).
+- Optional (rerank): Ollama with a local instruct model (e.g., `llama3.2:latest`).
 
 ## Outputs
 
-- `output/candidates.csv`: Top-k Uniclass candidates per IFC class with scores.
+- `output/candidates.csv`: Candidate list with blended or reranked scores.
 - `output/viewer_mapping.json`: Edges grouped by IFC class for a viewer.
+
+## CLI Reference
+
+- `--load`                Load IFC + Uniclass into DB (upsert)
+- `--embed`               Generate and store embeddings via Ollama
+- `--candidates`          Generate candidate mappings and auto-accept above threshold
+- `--export`              Export accepted mappings to `viewer_mapping.json`
+- `--reset-mappings`      Delete existing mappings for current Uniclass revision (see below)
+- `--reset-facets PR,SS`  Limit reset to listed Uniclass facets
+
+Reset examples:
+
+- Reset all facets for current revision: `--reset-mappings`
+- Reset only PR/SS: `--reset-mappings --reset-facets PR,SS`
 
 ## Getting Started
 
@@ -76,24 +99,41 @@ $env:DATABASE_URL = "postgresql://postgres:***@host.docker.internal:5432/iob_ifc
 # 4) Apply schema (requires pgvector installed on the server)
 psql "$env:DATABASE_URL" -f sql/schema.sql
 
-# 5) Optional: start Ollama for embeddings (once)
+# 5) Optional: start Ollama for embeddings and rerank (once)
 # docker run -d --name ollama -p 11434:11434 ollama/ollama
-# ollama pull nomic-embed-text
+# ollama pull mxbai-embed-large
+# ollama pull llama3.2:latest   # for rerank (or another small instruct model)
 
 # 6) Load source data into Postgres
 py etl/etl_map.py --config config/settings.yaml --load
 
-# 7) Generate embeddings (optional, improves candidates)
+# 7) Generate embeddings (re-run if model/text changes)
 py etl/etl_map.py --config config/settings.yaml --embed
 
-# 8) Generate candidate mappings (uses blended scoring if matching.embedding_weight > 0)
+# 8) (Optional) Reset previous mappings for current revision
+py etl/etl_map.py --config config/settings.yaml --reset-mappings
+py etl/etl_map.py --config config/settings.yaml --reset-facets PR,SS
+py etl/etl_map.py --config config/settings.yaml --reset-mappings --reset-facets PR,SS
+
+# 9) Generate candidates (blended or with rerank if rerank.top_n > 0)
 py etl/etl_map.py --config config/settings.yaml --candidates
 
-# 9) Export viewer JSON
+# 10) Export viewer JSON
 py etl/etl_map.py --config config/settings.yaml --export
 ```
 
 Tips:
 
 - Revision: Filenames like `..._v1_24.xlsx` auto-detect Uniclass revision; monotonic enforcement stops downgrades. Override in `config/settings.yaml`.
-- Embeddings: Default model `nomic-embed-text` (768 dims). If you change models, update `sql/schema.sql` (`vector(768)`) to match.
+- Embeddings: If you change model or embedded text format, clear old rows and re-embed:
+  - `DELETE FROM text_embedding WHERE entity_type IN ('ifc','uniclass');`
+  - Ensure `embedding.expected_dim` matches your model (e.g., 1024 for `mxbai-embed-large`).
+- Direction: `matching.direction: uniclass_to_ifc` is useful when each Uniclass item should receive at least one IFC candidate; combine with PR/SS-only scope via `skip_tables`.
+
+## Current State Summary
+
+- Performance: Tight loops optimized (dictionary lookups instead of per-iteration DataFrame `.loc`); cosine-based pgvector ranking aligned between ORDER BY and score.
+- Scoring: Blended lexical + embedding with feature multipliers; Uniclass anchors from XLSX boost known pairs; confidence clamped to [0,1] to satisfy DB constraints.
+- Embeddings: Enriched texts on both sides; supports `mxbai-embed-large` via `embedding.expected_dim`.
+- Rerank: Optional Ollama instruct-model re-rank with few-shot examples from anchors; controlled by `rerank.*` in config.
+- Maintenance: `--reset-mappings` and `--reset-facets` flags to safely clear mapping rows by revision/facet before regeneration.
