@@ -34,8 +34,8 @@ matching:
   embedding_weight: 0.25
   # number of nearest neighbors to consider from embeddings per IFC item
   embedding_top_k: 25
-  # Candidate direction: 'ifc_to_uniclass' (default) or 'uniclass_to_ifc'
-  direction: ifc_to_uniclass
+
+
   anchor_bonus: 0.3
   anchor_use_ancestors: true
   # Convenience: list facets to skip entirely during matching
@@ -48,7 +48,8 @@ matching:
     PR:
       require_ifc_roots: [IfcProduct]
     SS:
-      require_ifc_roots: [IfcGroup, IfcSystem]
+  require_ifc_roots: [IfcGroup, IfcSystem]
+  disallow_prefixes: [IfcBuiltSystem]
     PM:
       require_ifc_roots: [IfcProcess]
     AC:
@@ -67,11 +68,18 @@ embedding:
   timeout_s: 30
   # 1024 for mxbai-embed-large and bge-m3; 768 for jina-embeddings-v2-base-en
   expected_dim: 1024
+  # pgvector ANN tuning
+  ivf_lists: 128
+  ivf_probes: 8 # between 5-8 (lower = faster, slightly lower recall)
+  # query timeout for embedding neighbor search (milliseconds)
+  query_timeout_ms: 5000
 
 rerank:
-  top_n: 10
+  top_n: 0
   model: llama3.2
   endpoint: http://localhost:11434
   temperature: 0
   max_tokens: 512
   fewshot_per_facet: 3
+  timeout_s: 10
+

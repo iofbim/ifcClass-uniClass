@@ -128,7 +128,6 @@ Tips:
 - Embeddings: If you change model or embedded text format, clear old rows and re-embed:
   - `DELETE FROM text_embedding WHERE entity_type IN ('ifc','uniclass');`
   - Ensure `embedding.expected_dim` matches your model (e.g., 1024 for `mxbai-embed-large`).
-- Direction: `matching.direction: uniclass_to_ifc` is useful when each Uniclass item should receive at least one IFC candidate; combine with PR/SS-only scope via `skip_tables`.
 
 ## Current State Summary
 

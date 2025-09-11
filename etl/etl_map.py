@@ -43,6 +43,9 @@ class Settings:
     embed_batch_size: int
     embed_timeout_s: float
     embed_expected_dim: Optional[int]
+    embed_ivf_lists: int
+    embed_ivf_probes: int
+    embed_query_timeout_ms: int
     embedding_weight: float
     embedding_top_k: int
     # Anchor guidance from Uniclass IFC mapping columns
@@ -55,6 +58,7 @@ class Settings:
     rerank_temperature: float
     rerank_max_tokens: int
     rerank_fewshot_per_facet: int
+    rerank_timeout_s: float
 
 
 def _load_dotenv(dotenv_path: Optional[Path] = None) -> None:
@@ -148,6 +152,9 @@ def load_settings(path: Path) -> Settings:
         embed_batch_size=int((cfg.get("embedding", {}) or {}).get("batch_size", os.getenv("EMBED_BATCH_SIZE", 16))),
         embed_timeout_s=float((cfg.get("embedding", {}) or {}).get("timeout_s", os.getenv("EMBED_TIMEOUT_S", 30))),
         embed_expected_dim=(lambda v: int(v) if (v is not None and str(v).strip() != "") else None)((cfg.get("embedding", {}) or {}).get("expected_dim", os.getenv("EMBED_EXPECTED_DIM", ""))),
+        embed_ivf_lists=int((cfg.get("embedding", {}) or {}).get("ivf_lists", os.getenv("EMBED_IVF_LISTS", 100))),
+        embed_ivf_probes=int((cfg.get("embedding", {}) or {}).get("ivf_probes", os.getenv("EMBED_IVF_PROBES", 10))),
+        embed_query_timeout_ms=int((cfg.get("embedding", {}) or {}).get("query_timeout_ms", os.getenv("EMBED_QUERY_TIMEOUT_MS", 5000))),
         embedding_weight=float((cfg.get("matching", {}) or {}).get("embedding_weight", os.getenv("EMBEDDING_WEIGHT", 0.4))),
         embedding_top_k=int((cfg.get("matching", {}) or {}).get("embedding_top_k", os.getenv("EMBEDDING_TOP_K", 50))),
         anchor_bonus=float((cfg.get("matching", {}) or {}).get("anchor_bonus", os.getenv("ANCHOR_BONUS", 0.25))),
@@ -283,6 +290,7 @@ def rerank_candidates_with_llm(
     uc_titles = {str(r["code"]): (str(r.get("title", "")), str(r.get("facet", ""))) for _, r in uc_df.iterrows()}
     examples = _collect_anchor_examples(uc_df, fewshot_per_facet=fewshot_per_facet)
     rows = []
+    direction = (direction or 'ifc_to_uniclass').lower()
     if direction == 'uniclass_to_ifc':
         for code, grp in cands.groupby("code"):
             title, facet = uc_titles.get(str(code), ("", ""))
@@ -292,7 +300,6 @@ def rerank_candidates_with_llm(
             resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
             order = _parse_rerank_json(resp)
             order_map = {cid: sc for cid, sc in order}
-            # Merge back, default to original order if missing
             for r in grp.itertuples(index=False):
                 sc = order_map.get(str(r.ifc_id))
                 new_score = float(sc) if sc is not None else float(r.score)
@@ -300,11 +307,8 @@ def rerank_candidates_with_llm(
     else:
         for ifc_id, grp in cands.groupby("ifc_id"):
             lbl = ifc_labels.get(str(ifc_id), str(ifc_id))
-            # Use first facet/title for the prompt context
             grp_sorted = grp.sort_values("score", ascending=False).head(top_n)
-            # For candidates use Uniclass code with title
             cand_list = [(str(r.code), f"[{r.facet}] {r.uniclass_title}") for r in grp_sorted.itertuples(index=False)]
-            # NPC: facet context ambiguous; pick most common facet
             try:
                 facet = grp_sorted["facet"].mode().iat[0]
             except Exception:
@@ -605,6 +609,13 @@ def _facet_allows_ifc(
     r = (rules or {}).get(f, {}) or {}
     if not r:
         return True
+    # Disallow by IFC id prefixes per facet
+    try:
+        for pfx in (r.get("disallow_prefixes") or []):
+            if str(ifc_id).startswith(str(pfx)):
+                return False
+    except Exception:
+        pass
     if r.get("skip"):
         return False
     if r.get("abstract_only") and not bool(is_abstract_map.get(ifc_id, False)):
@@ -900,6 +911,10 @@ def expand_with_synonyms(text: str, synonyms: List[List[str]]) -> str:
     return t
 
 
+def _tokenize_set(s: str) -> set:
+    import re as _re
+    return set(t for t in _re.split(r"[^a-z0-9]+", normalize_text(s)) if t)
+
 def facet_heuristics(ifc_id: str) -> List[str]:
     f = []
     if ifc_id.startswith("Ifc") and (ifc_id.endswith("Element") or "Element" in ifc_id):
@@ -995,16 +1010,66 @@ def _fetch_embedding(conn: psycopg.Connection, entity_type: str, entity_id: str)
     return str(val) if val is not None else None
 
 
-def _embedding_neighbors(conn: psycopg.Connection, target_entity_type: str, qvec_text: str, limit: int) -> Dict[str, float]:
-    # Returns mapping neighbor_id -> cosine similarity in [0,1] (clamped)
-    # Rank and score consistently with cosine distance operator (<=>)
-    sql = (
-        "SELECT entity_id, 1 - (embedding <=> %s::vector) AS score "
-        "FROM text_embedding WHERE entity_type=%s "
-        "ORDER BY embedding <=> %s::vector ASC LIMIT %s"
-    )
+def _fetch_embeddings_map(conn: psycopg.Connection, entity_type: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
     with conn.cursor() as cur:
-        cur.execute(sql, (qvec_text, target_entity_type, qvec_text, limit))
+        cur.execute(
+            "SELECT entity_id, embedding::text FROM text_embedding WHERE entity_type=%s",
+            (entity_type,),
+        )
+        rows = cur.fetchall()
+    for r in rows:
+        if isinstance(r, dict):
+            eid = str(r.get("entity_id"))
+            vec = r.get("embedding")
+        else:
+            eid = str(r[0])
+            vec = r[1]
+        if eid and vec is not None:
+            out[eid] = str(vec)
+    return out
+
+def _embedding_neighbors(
+    conn: psycopg.Connection,
+    target_entity_type: str,
+    qvec_text: str,
+    limit: int,
+    facets: Optional[List[str]] = None,
+    timeout_ms: Optional[int] = None,
+) -> Dict[str, float]:
+    """Return mapping neighbor_id -> cosine similarity in [0,1] using pgvector.
+
+    - Uses ivfflat cosine distance (<=>) for ranking.
+    - When `target_entity_type='uniclass'` and `facets` provided, restricts
+      candidates to those facets via a join to `uniclass_item`.
+    - Applies a per-statement timeout if provided.
+    """
+    if target_entity_type == 'uniclass' and facets:
+        sql = (
+            "SELECT te.entity_id, 1 - (te.embedding <=> %s::vector) AS score "
+            "FROM text_embedding te JOIN uniclass_item u ON u.code = te.entity_id "
+            "WHERE te.entity_type=%s AND u.facet = ANY(%s) "
+            "ORDER BY te.embedding <=> %s::vector ASC LIMIT %s"
+        )
+        params = (qvec_text, target_entity_type, facets, qvec_text, limit)
+    else:
+        sql = (
+            "SELECT entity_id, 1 - (embedding <=> %s::vector) AS score "
+            "FROM text_embedding WHERE entity_type=%s "
+            "ORDER BY embedding <=> %s::vector ASC LIMIT %s"
+        )
+        params = (qvec_text, target_entity_type, qvec_text, limit)
+
+    with conn.cursor() as cur:
+        # Optional safety timeout
+        try:
+            if timeout_ms is None:
+                timeout_ms = int(os.getenv('EMBED_QUERY_TIMEOUT_MS', '5000'))
+            if timeout_ms and timeout_ms > 0:
+                cur.execute("SET LOCAL statement_timeout = %s", (int(timeout_ms),))
+        except Exception:
+            pass
+        cur.execute(sql, params)
         rows = cur.fetchall()
     out: Dict[str, float] = {}
     for r in rows:
@@ -1012,6 +1077,27 @@ def _embedding_neighbors(conn: psycopg.Connection, target_entity_type: str, qvec
         score = float(r[1] if not isinstance(r, dict) else r["score"])
         out[str(code)] = max(0.0, min(1.0, score))
     return out
+
+
+def ensure_vector_indexes(conn: psycopg.Connection, lists: int = 100) -> None:
+    """Create partial IVF Flat indexes for cosine distance if missing."""
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS text_embedding_ifc_cos_ivf
+            ON text_embedding USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = {int(lists)})
+            WHERE entity_type='ifc';
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS text_embedding_uc_cos_ivf
+            ON text_embedding USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = {int(lists)})
+            WHERE entity_type='uniclass';
+            """
+        )
 
 
 def generate_candidates_blended(
@@ -1047,23 +1133,37 @@ def generate_candidates_blended(
     is_abs = {str(r["ifc_id"]): bool(r.get("is_abstract", False)) for _, r in ifc_df.iterrows()}
     flags_map = _compute_ifc_flags(ifc_df, ancestors)
     base_alpha = float(embedding_weight)
-    for _, r in ifc_df.iterrows():
-        ifc_id = r["ifc_id"]
-        base_text = str(r.get("aug_text") or r.get("description") or "")
-        desc = normalize_text(base_text)
-        if not desc:
-            desc = normalize_text(str(r.get("label", "")))
-        q = expand_with_synonyms(f"{desc}".strip(), synonyms)
-        facets = facet_heuristics(ifc_id)
+    # Speed-ups: precompute IFC query text and facets map
+    ifc_work = ifc_df.copy()
+    if "aug_text" in ifc_work.columns:
+        _bt = ifc_work["aug_text"].fillna("")
+    else:
+        _bt = ifc_work["description"].fillna("")
+    _search = _bt.where(_bt.str.len() > 0, ifc_work["label"].fillna(""))
+    ifc_work["norm_q"] = _search.map(normalize_text).map(lambda s: expand_with_synonyms(s, synonyms))
+    ifc_q_map = pd.Series(ifc_work["norm_q"].values, index=ifc_work["ifc_id"].astype(str)).to_dict()
+    facets_map = {str(r["ifc_id"]): facet_heuristics(str(r["ifc_id"])) for _, r in ifc_df.iterrows()}
+    # Prefetch all IFC embeddings once to avoid per-IFC DB calls
+    ifc_vecs = _fetch_embeddings_map(conn, 'ifc')
+    for r in ifc_df.itertuples(index=False):
+        ifc_id = str(r.ifc_id)
+        q = ifc_q_map.get(ifc_id, "")
+        facets = facets_map.get(ifc_id, [])
         pool = uc_work if not facets else uc_work[uc_work["facet"].isin(facets)]
         if pool.empty:
             pool = uc_work
 
         # Embedding neighbor scores (if available)
         emb_scores: Dict[str, float] = {}
-        qvec_text = _fetch_ifc_embedding(conn, ifc_id)
+        qvec_text = ifc_vecs.get(ifc_id)
         if qvec_text:
-            emb_scores = _embedding_neighbors(conn, 'uniclass', qvec_text, embedding_top_k)
+            # Set ivfflat probes for better recall and ensure indexes
+            with conn.cursor() as _c:
+                try:
+                    _c.execute("SET LOCAL ivfflat.probes = %s", (int(os.getenv('EMBED_IVF_PROBES', '10')),))
+                except Exception:
+                    pass
+            emb_scores = _embedding_neighbors(conn, 'uniclass', qvec_text, embedding_top_k, facets=facets, timeout_ms=int(os.getenv('EMBED_QUERY_TIMEOUT_MS', '5000')))
             # Optionally filter by facets
             if facets:
                 emb_scores = {c: s for c, s in emb_scores.items() if uc_info.get(c, ("", "", ""))[0] in facets}
@@ -1171,6 +1271,7 @@ def generate_candidates_uc2ifc_blended(
         facet = str(u.get("facet", ""))
         title = str(u.get("title", ""))
         q = expand_with_synonyms(normalize_text(title), synonyms)
+        u_tokens = _tokenize_set(title)
         umaps = set([m for m in str(u.get("ifc_mappings", "") or "").split(";") if m])
 
         # If facet is globally skipped, then there will be no allowed IFCs
@@ -1181,6 +1282,11 @@ def generate_candidates_uc2ifc_blended(
         emb_scores: Dict[str, float] = {}
         qvec_text = _fetch_embedding(conn, "uniclass", code)
         if qvec_text:
+            with conn.cursor() as _c:
+                try:
+                    _c.execute("SET LOCAL ivfflat.probes = %s", (int(os.getenv('EMBED_IVF_PROBES', '10')),))
+                except Exception:
+                    pass
             emb_scores = _embedding_neighbors(conn, 'ifc', qvec_text, embedding_top_k)
 
         # Lexical: restrict to embedding neighbors if present, else full IFC set
@@ -1211,6 +1317,12 @@ def generate_candidates_uc2ifc_blended(
                 "pr_predefined_type": 0.10, "pr_manufacturer_ps": 0.10, "ss_group_system": 0.10, "type_bias": 0.05, "pset_count_scale": 0.002, "max_pset_boost": 0.25
             })
             final = ((1 - alpha) * lex + alpha * emb) * mult
+            # Token-overlap penalty: if Uniclass title shares no tokens with IFC id/label/desc, downweight
+            try:
+                if not (u_tokens & set(_tokenize_set(f"{ifc_id} {ifc_info.get(ifc_id, ('',''))[0]} {ifc_info.get(ifc_id, ('',''))[1]}"))):
+                    final *= 0.6
+            except Exception:
+                pass
             if umaps:
                 if anchor_use_ancestors:
                     anc = set(ancestors.get(str(ifc_id), [])) | {str(ifc_id)}
@@ -1466,25 +1578,40 @@ def main():
                 text = f"[{facet}] {code_tokens}: {title}"
                 uc_items.append((eid, text))
 
+            # Ensure vector indexes exist (safe to call repeatedly)
+            try:
+                ensure_vector_indexes(conn, lists=int(s.embed_ivf_lists))
+            except Exception as e:
+                print(f"[embed] index ensure failed (non-fatal): {e}")
+
             print(f"[embed] Generating embeddings using model '{s.embed_model}' at {s.embed_endpoint}")
             n_ifc = generate_and_store_embeddings(conn, "ifc", ifc_items, s.embed_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=s.embed_expected_dim)
             n_uc = generate_and_store_embeddings(conn, "uniclass", uc_items, s.embed_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=s.embed_expected_dim)
             print(f"[embed] Upserted {n_ifc} IFC and {n_uc} Uniclass embeddings")
 
         if args.candidates:
+            # Ensure vector indexes exist before neighbor queries
+            try:
+                ensure_vector_indexes(conn, lists=int(s.embed_ivf_lists))
+            except Exception as e:
+                print(f"[candidates] index ensure failed (non-fatal): {e}")
+            # Set probes for this session for better recall/latency tradeoff
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SET ivfflat.probes = %s", (int(s.embed_ivf_probes),))
+                    cur.execute("SET statement_timeout = %s", (int(s.embed_query_timeout_ms),))
+            except Exception:
+                pass
             use_embed = s.embedding_weight and float(s.embedding_weight) > 0
-            direction = (s.match_direction or 'ifc_to_uniclass').lower()
-            if direction == 'uniclass_to_ifc':
-                if use_embed:
-                    cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
-                else:
-                    # Lexical-only reverse direction using the same blended helper with alpha=0 via parameters
-                    cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, 0.0, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
+            direction = (s.match_direction or 'uniclass_to_ifc').lower()
+            if direction != 'uniclass_to_ifc':
+                print("[info] ifc_to_uniclass is disabled; forcing direction=uniclass_to_ifc")
+                direction = 'uniclass_to_ifc'
+            if use_embed:
+                cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
             else:
-                if use_embed:
-                    cands = generate_candidates_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
-                else:
-                    cands = generate_candidates(ifc_df, uc_df, s.synonyms, s.top_k, s.matching_rules)
+                # Lexical-only reverse direction using the same blended helper with alpha=0 via parameters
+                cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, 0.0, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
 
             # Optional LLM rerank
             if int(s.rerank_top_n or 0) > 0:
