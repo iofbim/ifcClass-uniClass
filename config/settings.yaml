@@ -38,8 +38,14 @@ matching:
 
   anchor_bonus: 0.3
   anchor_use_ancestors: true
+  # Discipline gating to reduce cross-domain mismatches (e.g., ELEC vs cleaning)
+  discipline_filter: soft   # options: none | soft (penalize) | hard (exclude)
+  discipline_penalty: 0.4   # multiplier if soft-mismatch
+  # Source of labels used for gating: heuristic | llm | llm_then_heuristic
+  discipline_source: llm_then_heuristic
   # Convenience: list facets to skip entirely during matching
-  skip_tables: [AC, CO, EF, EN, FI, MA, PC, PM, RK, RO, SL, ZZ, MA, TE]  # add more as needed e.g., [PC, FI, SL, ZZ] this setup only has PR and SS tables
+  # Focus only on PR facet; skip everything else
+  skip_tables: [AC, CO, EF, EN, FI, MA, PC, PM, RK, RO, SL, SS, ZZ, TE]
   # Optional facet-aware rules to constrain candidates
   # - skip: true            -> ignore the entire facet
   # - abstract_only: true   -> allow only abstract IFC classes
@@ -47,12 +53,12 @@ matching:
   rules:
     PR:
       require_ifc_roots: [IfcProduct]
-    SS:
-      require_ifc_roots: [IfcGroup, IfcSystem]
-    PM:
-      require_ifc_roots: [IfcProcess]
-    AC:
-      require_ifc_roots: [IfcProcess]
+    # SS:
+    #   require_ifc_roots: [IfcGroup, IfcSystem]
+    # PM:
+    #   require_ifc_roots: [IfcProcess]
+    # AC:
+    #   require_ifc_roots: [IfcProcess]
   # basic synonym hints to boost lexical scoring
   synonyms:
     - ["hvac","mechanical services","building services"]
@@ -74,8 +80,8 @@ embedding:
   query_timeout_ms: 5000
 
 rerank:
-  top_n: 0
-  model: dolphin3
+  top_n: 5
+  model: llama3.1:8b
   endpoint: http://localhost:11434
   temperature: 0
   max_tokens: 512

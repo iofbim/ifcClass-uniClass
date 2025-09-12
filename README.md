@@ -30,6 +30,18 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 - Re-rank (optional): If `rerank.top_n > 0`, per-item top‑N are re-scored by a local LLM (Ollama) using few-shot examples from the extracted anchors per facet.
 - Export (`--export`): Writes `output/viewer_mapping.json` summarizing accepted mappings.
 
+### LLM Classification + Label-Guided Matching
+
+- Classification (`--classify-disciplines`): Uses a local LLM (configured under `rerank.*`) to assign multi-label tags to each IFC class and Uniclass item.
+  - Labels include AECO disciplines and subjects/facets: `ARCH, STRUCT, CIVIL, MECH, PLUMB, ELEC, ICT, MAINT, ROLE, PM, ACTIVITIES, COMPLEX, AC, CO, EF, EN, FI, MA, PC, PM, PR, RK, RO, SL, SS` (excludes `ZZ`).
+  - Results are cached at `output/taxonomy_cache.json` and auto-loaded by candidate generation.
+- Label gating: Candidate generation compares IFC labels to Uniclass labels and penalizes or excludes mismatches.
+  - Configure in `config/settings.yaml` under `matching`:
+    - `discipline_filter`: `none | soft | hard`
+    - `discipline_penalty`: penalty multiplier when `soft`
+    - `discipline_source`: `heuristic | llm | llm_then_heuristic`
+  - With `llm_then_heuristic`, LLM labels are used when present; otherwise keyword/ancestor heuristics fill gaps.
+
 ## Configuration
 
 - YAML: Copy `config/settings.example.yaml` → `config/settings.yaml` and adjust file paths, thresholds, synonyms.
@@ -72,6 +84,7 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 - `--embed`               Generate and store embeddings via Ollama
 - `--candidates`          Generate candidate mappings and auto-accept above threshold
 - `--export`              Export accepted mappings to `viewer_mapping.json`
+- `--classify-disciplines` Classify IFC + Uniclass into labels (disciplines/subjects) via LLM; writes `output/taxonomy_cache.json`
 - `--reset-mappings`      Delete existing mappings for current Uniclass revision (see below)
 - `--reset-facets PR,SS`  Limit reset to listed Uniclass facets
 
@@ -133,6 +146,6 @@ Tips:
 
 - Performance: Tight loops optimized (dictionary lookups instead of per-iteration DataFrame `.loc`); cosine-based pgvector ranking aligned between ORDER BY and score.
 - Scoring: Blended lexical + embedding with feature multipliers; Uniclass anchors from XLSX boost known pairs; confidence clamped to [0,1] to satisfy DB constraints.
-- Embeddings: Enriched texts on both sides; supports `mxbai-embed-large` via `embedding.expected_dim`.
+- Embeddings: Enriched texts on both sides; supports `mxbai-embed-large` via `embedding.expected_dim`. Note: LLM classification affects matching (gating/penalties), not the embedding text. Re-embed only if you change the embedding model or decide to include labels into the embedded text (not enabled by default).
 - Rerank: Optional Ollama instruct-model re-rank with few-shot examples from anchors; controlled by `rerank.*` in config.
 - Maintenance: `--reset-mappings` and `--reset-facets` flags to safely clear mapping rows by revision/facet before regeneration.

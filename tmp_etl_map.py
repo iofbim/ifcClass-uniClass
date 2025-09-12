@@ -200,17 +200,6 @@ def _ollama_generate(prompt: str, model: str, endpoint: str, temperature: float 
         print(f"[rerank] ollama generate error: {e}")
         return None
 
-def _ollama_warmup(model: str, endpoint: str, timeout_s: float = 180.0) -> None:
-    """Warm up Ollama model load with a trivial prompt and generous timeout.
-
-    This helps avoid timeouts on the first real request when the model is still loading.
-    Non-fatal on failure.
-    """
-    try:
-        _ = _ollama_generate("OK", model=model, endpoint=endpoint, temperature=0.0, max_tokens=8, timeout_s=timeout_s)
-    except Exception:
-        pass
-
 
 def _collect_anchor_examples(uc_df: pd.DataFrame, fewshot_per_facet: int = 3) -> Dict[str, List[Tuple[str, str, List[str]]]]:
     by_facet: Dict[str, List[Tuple[str, str, List[str]]]] = {}
@@ -349,53 +338,16 @@ def classify_items_with_llm(
     model: str,
     endpoint: str,
     temperature: float = 0.0,
-    max_tokens: int = 96,
-    timeout_s: float = 45.0,
-    warmup_timeout_s: float = 180.0,
-    progress_every: int = 200,
-    sleep_between: float = 0.0,
-    max_retries: int = 2,
+    max_tokens: int = 128,
+    timeout_s: float = 30.0,
 ) -> Dict[str, List[str]]:
-    """Classify items via Ollama generate, with warmup, retries and basic rate limiting."""
     out: Dict[str, List[str]] = {}
-    # Warm up once to load the model
-    _ollama_warmup(model=model, endpoint=endpoint, timeout_s=warmup_timeout_s)
-    from time import sleep
-    for idx, (key, item_type, title, desc) in enumerate(items, start=1):
+    for key, item_type, title, desc in items:
         prompt = _format_label_prompt(item_type, key, title or "", desc or "")
-        resp: Optional[str] = None
-        for attempt in range(max(1, int(max_retries) + 1)):
-            tmo = float(timeout_s) * (1.5 ** attempt)
-            resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=tmo)
-            if resp:
-                break
-            if sleep_between > 0:
-                sleep(min(2.0, float(sleep_between)))
+        resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
         labels = _parse_label_array(resp)
         out[key] = labels
-        if progress_every and idx % int(progress_every) == 0:
-            print(f"[classify] progress: {idx}/{len(items)}")
-        if sleep_between > 0:
-            sleep(float(sleep_between))
     return out
-
-def _load_taxonomy_cache(path: Optional[Path] = None) -> Dict[str, List[str]]:
-    try:
-        p = path or (Path("output") / "taxonomy_cache.json")
-        if not p.exists():
-            return {}
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        clean: Dict[str, List[str]] = {}
-        for k, v in (data.items() if isinstance(data, dict) else []):
-            if isinstance(v, list):
-                vals = [str(x).upper() for x in v if isinstance(x, (str,)) and str(x).strip()]
-                # keep only allowed labels
-                vals = [x for x in vals if x in ALLOWED_LABELS]
-                clean[str(k)] = list(dict.fromkeys(vals))
-        return clean
-    except Exception:
-        return {}
 
 
 def rerank_candidates_with_llm(
@@ -1367,41 +1319,11 @@ def generate_candidates_blended(
     uc_subj_map = pd.Series(uc_work["subjects"].values, index=uc_work["code"].astype(str)).to_dict()
     # Unified labels (disciplines + subjects) per Uniclass code
     uc_label_map = {k: list(dict.fromkeys((uc_disc_map.get(k) or []) + (uc_subj_map.get(k) or []))) for k in uc_work["code"].astype(str)}
-    # Integrate optional LLM-provided labels for Uniclass (overrides or augments)
-    disc_source = str((rules or {}).get("__global__", {}).get("discipline_source", "heuristic")).lower()
-    # Load cached LLM labels if available (optional)
-    llm_labels = _load_taxonomy_cache()
-    if llm_labels and disc_source in ("llm", "llm_then_heuristic"):
-        for _code in list(uc_label_map.keys()):
-            _key = f"uc:{_code}"
-            _labs = llm_labels.get(_key)
-            if _labs:
-                if disc_source == "llm":
-                    uc_label_map[_code] = list(dict.fromkeys(_labs))
-                else:
-                    uc_label_map[_code] = list(dict.fromkeys(list(uc_label_map[_code]) + list(_labs)))
 
     rows = []
     ancestors = _build_ifc_ancestors_map(ifc_df)
     is_abs = {str(r["ifc_id"]): bool(r.get("is_abstract", False)) for _, r in ifc_df.iterrows()}
     flags_map = _compute_ifc_flags(ifc_df, ancestors)
-    # Ensure labels key present and merge LLM labels for IFC
-    try:
-        _ = next(iter(flags_map.values()))
-        for _iid in list(flags_map.keys()):
-            flags_map[_iid]["labels"] = list(dict.fromkeys(flags_map[_iid].get("labels", []) or flags_map[_iid].get("disciplines", []) or []))
-    except Exception:
-        pass
-    if llm_labels and disc_source in ("llm", "llm_then_heuristic"):
-        for _iid in list(flags_map.keys()):
-            _key = f"ifc:{_iid}"
-            _labs = llm_labels.get(_key)
-            if _labs:
-                if disc_source == "llm":
-                    flags_map[_iid]["labels"] = list(dict.fromkeys(_labs))
-                else:
-                    _prev = flags_map[_iid].get("labels", [])
-                    flags_map[_iid]["labels"] = list(dict.fromkeys(list(_prev) + list(_labs)))
     base_alpha = float(embedding_weight)
     # Speed-ups: precompute IFC query text and facets map
     ifc_work = ifc_df.copy()
@@ -1569,31 +1491,6 @@ def generate_candidates_uc2ifc_blended(
     ancestors = _build_ifc_ancestors_map(ifc_work)
     is_abs = {str(r["ifc_id"]): bool(r.get("is_abstract", False)) for _, r in ifc_work.iterrows()}
     flags_map = _compute_ifc_flags(ifc_work, ancestors)
-    # Load LLM taxonomy cache (optional) and prepare label maps
-    llm_labels = _load_taxonomy_cache()
-    disc_source = str((rules or {}).get("__global__", {}).get("discipline_source", "heuristic")).lower()
-    try:
-        for _iid in list(flags_map.keys()):
-            flags_map[_iid]["labels"] = list(dict.fromkeys(flags_map[_iid].get("labels", []) or flags_map[_iid].get("disciplines", []) or []))
-    except Exception:
-        pass
-    if llm_labels and disc_source in ("llm", "llm_then_heuristic"):
-        for _iid in list(flags_map.keys()):
-            _labs = llm_labels.get(f"ifc:{_iid}")
-            if _labs:
-                if disc_source == "llm":
-                    flags_map[_iid]["labels"] = list(dict.fromkeys(_labs))
-                else:
-                    prev = flags_map[_iid]["labels"]
-                    flags_map[_iid]["labels"] = list(dict.fromkeys(list(prev) + list(_labs)))
-    uc_llm_map: Dict[str, List[str]] = {}
-    if llm_labels and disc_source in ("llm", "llm_then_heuristic"):
-        for _, _u in uc_df.iterrows():
-            _code = str(_u.get("code", ""))
-            if _code:
-                labs = llm_labels.get(f"uc:{_code}")
-                if labs:
-                    uc_llm_map[_code] = list(dict.fromkeys(labs))
 
     rows = []
     # Discipline options
@@ -1637,18 +1534,17 @@ def generate_candidates_uc2ifc_blended(
                 norm_t = ifc_id_to_norm.get(str(ifc_id))
                 if not norm_t:
                     continue
-                # Discipline/subject labels for UC (LLM first if available)
-                uc_discs = set(uc_llm_map.get(code, []) or [])
-                if not uc_discs or disc_source == "heuristic":
-                    lt = title.lower()
-                    if any(k in lt for k in ["duct", "hvac", "air ", "fan", "coil", "damper"]): uc_discs.add("MECH")
-                    if any(k in lt for k in ["pipe", "sanitary", "plumb", "drain", "valve", "tap", "waste"]): uc_discs.add("PLUMB")
-                    if any(k in lt for k in ["elect", "cable", "switch", "socket", "luminaire", "lighting", "breaker", "panel"]): uc_discs.add("ELEC")
-                    if any(k in lt for k in ["beam", "column", "slab", "rebar", "struct"]): uc_discs.add("STRUCT")
-                    if any(k in lt for k in ["door", "window", "glaz", "partition", "flooring", "covering", "furniture"]): uc_discs.add("ARCH")
-                    if any(k in lt for k in ["road", "pavement", "asphalt", "drainage", "culvert", "embankment"]): uc_discs.add("CIVIL")
-                    if any(k in lt for k in ["data", "network", "router", "server", "ict", "comm"]): uc_discs.add("ICT")
-                    if any(k in lt for k in ["clean", "chemical", "detergent", "gel"]): uc_discs.add("MAINT")
+                # Discipline gating: infer UC disciplines from title text on the fly
+                uc_discs = set()
+                lt = title.lower()
+                if any(k in lt for k in ["duct", "hvac", "air ", "fan", "coil", "damper"]): uc_discs.add("MECH")
+                if any(k in lt for k in ["pipe", "sanitary", "plumb", "drain", "valve", "tap", "waste"]): uc_discs.add("PLUMB")
+                if any(k in lt for k in ["elect", "cable", "switch", "socket", "luminaire", "lighting", "breaker", "panel"]): uc_discs.add("ELEC")
+                if any(k in lt for k in ["beam", "column", "slab", "rebar", "struct"]): uc_discs.add("STRUCT")
+                if any(k in lt for k in ["door", "window", "glaz", "partition", "flooring", "covering", "furniture"]): uc_discs.add("ARCH")
+                if any(k in lt for k in ["road", "pavement", "asphalt", "drainage", "culvert", "embankment"]): uc_discs.add("CIVIL")
+                if any(k in lt for k in ["data", "network", "router", "server", "ict", "comm"]): uc_discs.add("ICT")
+                if any(k in lt for k in ["clean", "chemical", "detergent", "gel"]): uc_discs.add("MAINT")
                 mult_disc = 1.0
                 if disc_mode in ("soft", "hard"):
                     # include Uniclass facet as subject label
@@ -1668,17 +1564,16 @@ def generate_candidates_uc2ifc_blended(
                 ifc_id = str(r["ifc_id"])
                 if not _facet_allows_ifc(ifc_id, facet, rules or {}, ancestors, is_abs, flags_map):
                     continue
-                uc_discs = set(uc_llm_map.get(code, []) or [])
-                if not uc_discs or disc_source == "heuristic":
-                    lt = title.lower()
-                    if any(k in lt for k in ["duct", "hvac", "air ", "fan", "coil", "damper"]): uc_discs.add("MECH")
-                    if any(k in lt for k in ["pipe", "sanitary", "plumb", "drain", "valve", "tap", "waste"]): uc_discs.add("PLUMB")
-                    if any(k in lt for k in ["elect", "cable", "switch", "socket", "luminaire", "lighting", "breaker", "panel"]): uc_discs.add("ELEC")
-                    if any(k in lt for k in ["beam", "column", "slab", "rebar", "struct"]): uc_discs.add("STRUCT")
-                    if any(k in lt for k in ["door", "window", "glaz", "partition", "flooring", "covering", "furniture"]): uc_discs.add("ARCH")
-                    if any(k in lt for k in ["road", "pavement", "asphalt", "drainage", "culvert", "embankment"]): uc_discs.add("CIVIL")
-                    if any(k in lt for k in ["data", "network", "router", "server", "ict", "comm"]): uc_discs.add("ICT")
-                    if any(k in lt for k in ["clean", "chemical", "detergent", "gel"]): uc_discs.add("MAINT")
+                lt = title.lower()
+                uc_discs = set()
+                if any(k in lt for k in ["duct", "hvac", "air ", "fan", "coil", "damper"]): uc_discs.add("MECH")
+                if any(k in lt for k in ["pipe", "sanitary", "plumb", "drain", "valve", "tap", "waste"]): uc_discs.add("PLUMB")
+                if any(k in lt for k in ["elect", "cable", "switch", "socket", "luminaire", "lighting", "breaker", "panel"]): uc_discs.add("ELEC")
+                if any(k in lt for k in ["beam", "column", "slab", "rebar", "struct"]): uc_discs.add("STRUCT")
+                if any(k in lt for k in ["door", "window", "glaz", "partition", "flooring", "covering", "furniture"]): uc_discs.add("ARCH")
+                if any(k in lt for k in ["road", "pavement", "asphalt", "drainage", "culvert", "embankment"]): uc_discs.add("CIVIL")
+                if any(k in lt for k in ["data", "network", "router", "server", "ict", "comm"]): uc_discs.add("ICT")
+                if any(k in lt for k in ["clean", "chemical", "detergent", "gel"]): uc_discs.add("MAINT")
                 mult_disc = 1.0
                 if disc_mode in ("soft", "hard"):
                     try:
@@ -1888,14 +1783,6 @@ def main():
     ap.add_argument("--reset-mappings", action="store_true", help="Delete existing mappings for current Uniclass revision (optionally filter by --reset-facets)")
     ap.add_argument("--reset-facets", type=str, default="", help="Comma-separated Uniclass facets to reset (e.g., PR,SS)")
     ap.add_argument("--embed", action="store_true", help="Generate embeddings via Ollama and store in DB")
-    ap.add_argument("--classify-disciplines", action="store_true", help="Classify IFC and Uniclass into labels via LLM and cache to output/taxonomy_cache.json")
-    ap.add_argument("--classify-scope", choices=["both","ifc","uniclass"], default="both", help="Limit classification to IFC, Uniclass, or both")
-    ap.add_argument("--classify-facets", type=str, default="", help="Comma-separated Uniclass facets to classify (e.g., PR,SS). Empty = all")
-    ap.add_argument("--classify-limit", type=int, default=0, help="Stop after N items (0 = no limit)")
-    ap.add_argument("--classify-model", type=str, default="", help="Override model for classification (defaults to rerank.model)")
-    ap.add_argument("--classify-timeout", type=float, default=0.0, help="Per-call timeout seconds (0 = use rerank.timeout_s)")
-    ap.add_argument("--classify-warmup-timeout", type=float, default=180.0, help="Warmup timeout seconds for first model load")
-    ap.add_argument("--classify-sleep", type=float, default=0.0, help="Sleep seconds between calls for rate limiting")
     args = ap.parse_args()
 
     s = load_settings(Path(args.config))
@@ -1920,59 +1807,6 @@ def main():
         uc_df = read_uniclass_xlsx_dir(s.uniclass_xlsx_dir, s.uniclass_revision)
     else:
         uc_df = read_uniclass_csvs(s.uniclass_csvs, s.uniclass_revision)
-
-    # Optional: LLM discipline/subject classification
-    if args.classify_disciplines:
-        print("[classify] Preparing items for LLM classification...")
-        items: List[Tuple[str, str, str, str]] = []
-        scope = (args.classify_scope or "both").lower()
-        facet_filter = [f.strip().upper() for f in (args.classify_facets or "").split(',') if f.strip()]
-        # IFC items
-        if scope in ("both", "ifc"):
-            for _, r in ifc_df.iterrows():
-                iid = str(r.get("ifc_id", ""))
-                if not iid:
-                    continue
-                title = str(r.get("label", ""))
-                desc = str(r.get("aug_text") or r.get("description") or "")
-                items.append((f"ifc:{iid}", "IFC", title, desc))
-        # Uniclass items
-        if scope in ("both", "uniclass"):
-            uc_src = uc_df
-            if facet_filter:
-                uc_src = uc_src[uc_src["facet"].astype(str).str.upper().isin(facet_filter)]
-            for _, r in uc_src.iterrows():
-                code = str(r.get("code", ""))
-                if not code:
-                    continue
-                title = str(r.get("title", ""))
-                desc = str(r.get("description", ""))
-                items.append((f"uc:{code}", "Uniclass", title, desc))
-        if int(args.classify_limit or 0) > 0:
-            items = items[: int(args.classify_limit)]
-        c_model = (args.classify_model or s.rerank_model)
-        per_call_timeout = float(args.classify_timeout or 0.0) or float(s.rerank_timeout_s) or 45.0
-        print(f"[classify] Classifying {len(items)} items using {c_model} at {s.rerank_endpoint}")
-        labels_map = classify_items_with_llm(
-            items,
-            model=c_model,
-            endpoint=s.rerank_endpoint,
-            temperature=s.rerank_temperature,
-            max_tokens=min(128, s.rerank_max_tokens),
-            timeout_s=max(20.0, per_call_timeout),
-            warmup_timeout_s=max(60.0, float(args.classify_warmup_timeout or 180.0)),
-            progress_every=200,
-            sleep_between=float(args.classify_sleep or 0.0),
-            max_retries=2,
-        )
-        out_path = s.output_dir / "taxonomy_cache.json"
-        s.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(labels_map, f, ensure_ascii=False, indent=2)
-        print(f"[classify] Wrote {out_path}")
-        # Exit early if only classification requested
-        if not (args.load or args.candidates or args.export or args.embed or args.reset_mappings):
-            return
 
     with connect(s.db_url) as conn:
         # Enforce monotonic revision if enabled
