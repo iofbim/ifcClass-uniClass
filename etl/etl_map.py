@@ -59,6 +59,11 @@ class Settings:
     rerank_max_tokens: int
     rerank_fewshot_per_facet: int
     rerank_timeout_s: float
+    # Optional OpenAI-specific overrides
+    openai_embed_model: Optional[str]
+    openai_embed_expected_dim: Optional[int]
+    openai_rerank_model: Optional[str]
+    # Optional: future room for provider-specific defaults (kept minimal here)
     
 
 
@@ -136,6 +141,11 @@ def load_settings(path: Path) -> Settings:
         "max_pset_boost": float(fb_cfg.get("max_pset_boost", 0.25)),
     }
 
+    # OpenAI-specific optional overrides
+    emb_openai_model = str((cfg.get("embedding", {}) or {}).get("openai_model", os.getenv("OPENAI_EMBED_MODEL", ""))) or None
+    emb_openai_expected_dim = (lambda v: int(v) if (v is not None and str(v).strip() != "") else None)((cfg.get("embedding", {}) or {}).get("openai_expected_dim", os.getenv("OPENAI_EMBED_EXPECTED_DIM", "")))
+    rr_openai_model = str((cfg.get("rerank", {}) or {}).get("openai_model", os.getenv("OPENAI_RERANK_MODEL", ""))) or None
+
     return Settings(
         db_url=env_db_url or cfg["db_url"],
         ifc_json=Path(cfg["ifc"]["json_path"]).expanduser(),
@@ -175,6 +185,9 @@ def load_settings(path: Path) -> Settings:
         rerank_max_tokens=int((cfg.get("rerank", {}) or {}).get("max_tokens", os.getenv("RERANK_MAX_TOKENS", 512))),
         rerank_fewshot_per_facet=int((cfg.get("rerank", {}) or {}).get("fewshot_per_facet", os.getenv("RERANK_FEWSHOT_PER_FACET", 3))),
         rerank_timeout_s=float((cfg.get("rerank", {}) or {}).get("timeout_s", os.getenv("RERANK_TIMEOUT_S", 20))),
+        openai_embed_model=emb_openai_model,
+        openai_embed_expected_dim=emb_openai_expected_dim,
+        openai_rerank_model=rr_openai_model,
     )
 
 
@@ -198,6 +211,37 @@ def _ollama_generate(prompt: str, model: str, endpoint: str, temperature: float 
         return data.get("response") or data.get("text")
     except Exception as e:
         print(f"[rerank] ollama generate error: {e}")
+        return None
+
+
+def _openai_generate(prompt: str, model: str, temperature: float = 0.0, max_tokens: int = 512, timeout_s: float = 60.0) -> Optional[str]:
+    """Call OpenAI Chat Completions (v1 SDK) to generate JSON text.
+
+    Requires OPENAI_API_KEY in environment. Optional OPENAI_BASE_URL supported for Azure/proxy.
+    """
+    try:
+        from openai import OpenAI  # type: ignore
+    except (ImportError, ModuleNotFoundError):
+        print("[llm] OpenAI SDK not installed. Run: pip install openai")
+        return None
+    try:
+        client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_BASE_URL") or None,
+            timeout=timeout_s,  # type: ignore
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a helpful AI that returns JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=float(temperature or 0.0),
+            max_tokens=int(max_tokens or 256),
+        )
+        return (resp.choices[0].message.content or "") if resp and resp.choices else None
+    except Exception as e:
+        print(f"[llm] OpenAI generate error: {e}")
         return None
 
 def _ollama_warmup(model: str, endpoint: str, timeout_s: float = 180.0) -> None:
@@ -355,18 +399,23 @@ def classify_items_with_llm(
     progress_every: int = 200,
     sleep_between: float = 0.0,
     max_retries: int = 2,
+    provider: str = "ollama",
 ) -> Dict[str, List[str]]:
-    """Classify items via Ollama generate, with warmup, retries and basic rate limiting."""
+    """Classify items via Ollama or OpenAI, with retries and basic rate limiting."""
     out: Dict[str, List[str]] = {}
-    # Warm up once to load the model
-    _ollama_warmup(model=model, endpoint=endpoint, timeout_s=warmup_timeout_s)
+    # Warm up Ollama once to load the model
+    if (provider or "ollama").lower() != "openai":
+        _ollama_warmup(model=model, endpoint=endpoint, timeout_s=warmup_timeout_s)
     from time import sleep
     for idx, (key, item_type, title, desc) in enumerate(items, start=1):
         prompt = _format_label_prompt(item_type, key, title or "", desc or "")
         resp: Optional[str] = None
         for attempt in range(max(1, int(max_retries) + 1)):
             tmo = float(timeout_s) * (1.5 ** attempt)
-            resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=tmo)
+            if (provider or "ollama").lower() == "openai":
+                resp = _openai_generate(prompt, model=model, temperature=temperature, max_tokens=max_tokens, timeout_s=tmo)
+            else:
+                resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=tmo)
             if resp:
                 break
             if sleep_between > 0:
@@ -410,6 +459,7 @@ def rerank_candidates_with_llm(
     max_tokens: int,
     fewshot_per_facet: int,
     timeout_s: float,
+    provider: str = "ollama",
 ) -> pd.DataFrame:
     if top_n <= 0 or cands.empty:
         return cands
@@ -425,7 +475,10 @@ def rerank_candidates_with_llm(
             grp_sorted = grp.sort_values("score", ascending=False).head(top_n)
             cand_list = [(str(r.ifc_id), ifc_labels.get(str(r.ifc_id), str(r.ifc_id))) for r in grp_sorted.itertuples(index=False)]
             prompt = _format_rerank_prompt(direction, f"Uniclass {code}: {title}", "", facet, cand_list, examples)
-            resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
+            if (provider or "ollama").lower() == "openai":
+                resp = _openai_generate(prompt, model=model, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
+            else:
+                resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
             order = _parse_rerank_json(resp)
             order_map = {cid: sc for cid, sc in order}
             for r in grp.itertuples(index=False):
@@ -442,7 +495,10 @@ def rerank_candidates_with_llm(
             except Exception:
                 facet = ""
             prompt = _format_rerank_prompt(direction, f"IFC {ifc_id}: {lbl}", "", facet, cand_list, examples)
-            resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
+            if (provider or "ollama").lower() == "openai":
+                resp = _openai_generate(prompt, model=model, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
+            else:
+                resp = _ollama_generate(prompt, model=model, endpoint=endpoint, temperature=temperature, max_tokens=max_tokens, timeout_s=timeout_s)
             order = _parse_rerank_json(resp)
             order_map = {cid: sc for cid, sc in order}
             for r in grp.itertuples(index=False):
@@ -478,6 +534,32 @@ def _ollama_embed(text: str, model: str, endpoint: str, timeout_s: float) -> Opt
         return None
 
 
+def _openai_embed(text: str, model: str, timeout_s: float) -> Optional[List[float]]:
+    """Create an embedding via OpenAI Embeddings API (v1 SDK).
+
+    Uses OPENAI_API_KEY and optional OPENAI_BASE_URL from environment.
+    """
+    try:
+        from openai import OpenAI  # type: ignore
+    except (ImportError, ModuleNotFoundError):
+        print("[embed] OpenAI SDK not installed. Run: pip install openai")
+        return None
+    try:
+        client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_BASE_URL") or None,
+            timeout=timeout_s,  # type: ignore
+        )
+        resp = client.embeddings.create(model=model, input=text)
+        vec = resp.data[0].embedding if resp and resp.data else None
+        if not isinstance(vec, list):
+            raise ValueError("Unexpected OpenAI embedding response format")
+        return [float(x) for x in vec]
+    except Exception as e:
+        print(f"[embed] OpenAI embed error (len={len(text)}): {e}")
+        return None
+
+
 def _ensure_vector_literal(vec: List[float], expected_dim: Optional[int] = None) -> str:
     if expected_dim is not None and len(vec) != expected_dim:
         raise ValueError(f"Embedding dim {len(vec)} != expected {expected_dim}")
@@ -501,6 +583,7 @@ def generate_and_store_embeddings(
     batch_size: int,
     timeout_s: float,
     expected_dim: Optional[int] = 768,
+    provider: str = "ollama",
 ) -> int:
     # Skip ones that already exist
     existing = _existing_embedding_ids(conn, entity_type)
@@ -511,7 +594,10 @@ def generate_and_store_embeddings(
     for chunk in _chunked(todo, batch_size):
         rows = []
         for eid, text in chunk:
-            vec = _ollama_embed(text, model=model, endpoint=endpoint, timeout_s=timeout_s)
+            if (provider or "ollama").lower() == "openai":
+                vec = _openai_embed(text, model=model, timeout_s=timeout_s)
+            else:
+                vec = _ollama_embed(text, model=model, endpoint=endpoint, timeout_s=timeout_s)
             if vec is None:
                 continue
             lit = _ensure_vector_literal(vec, expected_dim=expected_dim)
@@ -1887,7 +1973,8 @@ def main():
     # Optional maintenance flags
     ap.add_argument("--reset-mappings", action="store_true", help="Delete existing mappings for current Uniclass revision (optionally filter by --reset-facets)")
     ap.add_argument("--reset-facets", type=str, default="", help="Comma-separated Uniclass facets to reset (e.g., PR,SS)")
-    ap.add_argument("--embed", action="store_true", help="Generate embeddings via Ollama and store in DB")
+    ap.add_argument("--embed", action="store_true", help="Generate embeddings via AI backend and store in DB")
+    ap.add_argument("--openai", action="store_true", help="Use OpenAI API for embedding, classification, and rerank (default is Ollama)")
     ap.add_argument("--classify-disciplines", action="store_true", help="Classify IFC and Uniclass into labels via LLM and cache to output/taxonomy_cache.json")
     ap.add_argument("--classify-scope", choices=["both","ifc","uniclass"], default="both", help="Limit classification to IFC, Uniclass, or both")
     ap.add_argument("--classify-facets", type=str, default="", help="Comma-separated Uniclass facets to classify (e.g., PR,SS). Empty = all")
@@ -1950,9 +2037,16 @@ def main():
                 items.append((f"uc:{code}", "Uniclass", title, desc))
         if int(args.classify_limit or 0) > 0:
             items = items[: int(args.classify_limit)]
-        c_model = (args.classify_model or s.rerank_model)
+        # Choose model based on backend; args.classify_model overrides
+        if args.openai:
+            default_cls_model = s.openai_rerank_model or s.rerank_model
+        else:
+            default_cls_model = s.rerank_model
+        c_model = (args.classify_model or default_cls_model)
         per_call_timeout = float(args.classify_timeout or 0.0) or float(s.rerank_timeout_s) or 45.0
-        print(f"[classify] Classifying {len(items)} items using {c_model} at {s.rerank_endpoint}")
+        backend = "openai" if args.openai else "ollama"
+        target = ("OpenAI" if backend == "openai" else s.rerank_endpoint)
+        print(f"[classify] Classifying {len(items)} items using {c_model} via {backend} ({target})")
         labels_map = classify_items_with_llm(
             items,
             model=c_model,
@@ -1964,6 +2058,7 @@ def main():
             progress_every=200,
             sleep_between=float(args.classify_sleep or 0.0),
             max_retries=2,
+            provider=backend,
         )
         out_path = s.output_dir / "taxonomy_cache.json"
         s.output_dir.mkdir(parents=True, exist_ok=True)
@@ -2053,9 +2148,18 @@ def main():
             except Exception as e:
                 print(f"[embed] index ensure failed (non-fatal): {e}")
 
-            print(f"[embed] Generating embeddings using model '{s.embed_model}' at {s.embed_endpoint}")
-            n_ifc = generate_and_store_embeddings(conn, "ifc", ifc_items, s.embed_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=s.embed_expected_dim)
-            n_uc = generate_and_store_embeddings(conn, "uniclass", uc_items, s.embed_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=s.embed_expected_dim)
+            backend = "openai" if args.openai else "ollama"
+            target = ("OpenAI" if backend == "openai" else s.embed_endpoint)
+            # Choose model/expected_dim by backend
+            if backend == "openai":
+                e_model = s.openai_embed_model or s.embed_model
+                e_dim = s.openai_embed_expected_dim if s.openai_embed_expected_dim is not None else s.embed_expected_dim
+            else:
+                e_model = s.embed_model
+                e_dim = s.embed_expected_dim
+            print(f"[embed] Generating embeddings using model '{e_model}' via {backend} ({target})")
+            n_ifc = generate_and_store_embeddings(conn, "ifc", ifc_items, e_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=e_dim, provider=backend)
+            n_uc = generate_and_store_embeddings(conn, "uniclass", uc_items, e_model, s.embed_endpoint, s.embed_batch_size, s.embed_timeout_s, expected_dim=e_dim, provider=backend)
             print(f"[embed] Upserted {n_ifc} IFC and {n_uc} Uniclass embeddings")
 
         if args.candidates:
@@ -2095,18 +2199,22 @@ def main():
                 else:
                     # Proceed with rerank, per-call timeout is enforced
                     try:
+                        backend = "openai" if args.openai else "ollama"
+                        # Choose rerank model per backend
+                        r_model = (s.openai_rerank_model or s.rerank_model) if backend == 'openai' else s.rerank_model
                         cands = rerank_candidates_with_llm(
                             cands,
                             ifc_df,
                             uc_df,
                             direction=direction,
                             top_n=int(s.rerank_top_n),
-                            model=s.rerank_model,
+                            model=r_model,
                             endpoint=s.rerank_endpoint,
                             temperature=float(s.rerank_temperature),
                             max_tokens=int(s.rerank_max_tokens),
                             fewshot_per_facet=int(s.rerank_fewshot_per_facet),
                             timeout_s=float(s.rerank_timeout_s),
+                            provider=backend,
                         )
                     except Exception as e:
                         print(f"[rerank] skipped due to error: {e}")

@@ -42,6 +42,33 @@ This repository establishes structured mappings between Uniclass 2015 classifica
     - `discipline_source`: `heuristic | llm | llm_then_heuristic`
   - With `llm_then_heuristic`, LLM labels are used when present; otherwise keyword/ancestor heuristics fill gaps.
 
+#### Classification CLI Options
+
+- `--classify-disciplines`: Run the classifier and write `output/taxonomy_cache.json`.
+- `--classify-scope`: `both | ifc | uniclass` (default `both`).
+- `--classify-facets`: Comma-separated Uniclass facets to include (e.g., `PR,SS`). Empty = all.
+- `--classify-limit`: Stop after N items (0 = no limit).
+- `--classify-model`: Override model just for classification (defaults to `rerank.model`).
+- `--classify-timeout`: Per-call timeout seconds (0 = use `rerank.timeout_s`).
+- `--classify-warmup-timeout`: Timeout seconds for the initial model load.
+- `--classify-sleep`: Sleep seconds between calls (simple rate limiting).
+
+Notes:
+- The classifier uses the same Ollama endpoint configured for reranking (`rerank.endpoint`).
+- The cache is id-keyed: `ifc:<IfcId>` and `uc:<Code>`, with values as arrays of uppercased labels.
+- Matching honors `matching.discipline_source` to pick `heuristic`, `llm`, or `llm_then_heuristic` when labels are present.
+
+#### Quick Examples
+
+- Classify all IFC + Uniclass items and stop:
+  - `py etl/etl_map.py --config config/settings.yaml --classify-disciplines`
+- Classify only Uniclass PR/SS and then generate candidates using those labels:
+  - `py etl/etl_map.py --config config/settings.yaml --classify-disciplines --classify-scope uniclass --classify-facets PR,SS`
+  - `py etl/etl_map.py --config config/settings.yaml --candidates`
+-
+  Rebuild the cache with a different model and a 30s timeout:
+  - `py etl/etl_map.py --config config/settings.yaml --classify-disciplines --classify-model llama3.2:latest --classify-timeout 30`
+
 ## Configuration
 
 - YAML: Copy `config/settings.example.yaml` → `config/settings.yaml` and adjust file paths, thresholds, synonyms.
@@ -87,6 +114,16 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 - `--classify-disciplines` Classify IFC + Uniclass into labels (disciplines/subjects) via LLM; writes `output/taxonomy_cache.json`
 - `--reset-mappings`      Delete existing mappings for current Uniclass revision (see below)
 - `--reset-facets PR,SS`  Limit reset to listed Uniclass facets
+
+Classification flags:
+
+- `--classify-scope both|ifc|uniclass`  Limit which side to classify
+- `--classify-facets PR,SS`             Limit Uniclass facets to classify
+- `--classify-limit N`                  Stop after N items (0 = no limit)
+- `--classify-model name`               Override Ollama model for classification
+- `--classify-timeout SECONDS`          Per-call timeout (falls back to `rerank.timeout_s`)
+- `--classify-warmup-timeout SECONDS`   Warmup timeout for initial model load
+- `--classify-sleep SECONDS`            Sleep between requests for rate limiting
 
 Reset examples:
 
