@@ -12,12 +12,13 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 
 - IFC: Classes with `ifc_id`, `schema_version`, `label`, `description`.
 - Uniclass: Items with `code`, `facet` (EF/SS/PR/... inferred), `title`, `description`, `revision`.
+  - Note: `description` is intentionally not used by the pipeline and is stored empty; prompts and embeddings rely on title + facet/section context.
 - Mappings: `ifc_uniclass_map` stores edges with `relation_type` (typical_of, part_of, equivalent), `confidence`, and provenance (IFC version, Uniclass revision).
 
 ## ETL Flow
 
 - Load (`--load`): Upserts IFC classes and Uniclass items.
-- Embed (`--embed`): Generates embeddings with Ollama and stores in `text_embedding`.
+- Embed (`--embed`): Generates embeddings with the selected AI backend and stores in `text_embedding`.
   - IFC text: identifier + description/definition with parent-chain context (optional), plus compact feature hints (e.g., role, kind, psets).
   - Uniclass text: enriched with `[FACET] Code tokens: Title` (e.g., `[PR] Pr 20 93: Unit structure and general products`).
   - Recommended embed model: `mxbai-embed-large` (1024‑dim); set `embedding.expected_dim: 1024`.
@@ -32,9 +33,19 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 
 ### LLM Classification + Label-Guided Matching
 
-- Classification (`--classify-disciplines`): Uses a local LLM (configured under `rerank.*`) to assign multi-label tags to each IFC class and Uniclass item.
-  - Labels include AECO disciplines and subjects/facets: `ARCH, STRUCT, CIVIL, MECH, PLUMB, ELEC, ICT, MAINT, ROLE, PM, ACTIVITIES, COMPLEX, AC, CO, EF, EN, FI, MA, PC, PM, PR, RK, RO, SL, SS` (excludes `ZZ`).
-  - Results are cached at `output/taxonomy_cache.json` and auto-loaded by candidate generation.
+- Classification (`--classify-disciplines`): Uses the configured AI backend to assign multi-label tags to each IFC class and Uniclass item.
+  - Labels include AECO disciplines and subjects: `ARCH, STRUCT, CIVIL, MECH, PLUMB, ELEC, ICT, MAINT, ROLE, PM, ACTIVITIES, COMPLEX`.
+  - Note: Uniclass facet codes (e.g., `PR`, `SS`) are attached internally from the source data and do not need to be produced by the classifier.
+  - Live cache: results are written incrementally to `output/taxonomy_cache.json` and auto-loaded by candidate generation. Subsequent runs skip cached items; delete the file to reclassify all.
+
+Section-level Uniclass classification
+
+- To reduce cost and keep results consistent, Uniclass items are classified at the Section level and labels are propagated to all child items within that section.
+- Section key = `Facet_Group_Subgroup_Section` (first 4 tokens of the code). Example:
+  - Code `Pr_15_31_04_02` (Acid neutralization products) belongs to section `Pr_15_31_04` (Applied cleaning and treatment products).
+  - The classifier runs once for `uc:Pr_15_31_04` and the resulting labels apply to `Pr_15_31_04` and all descendants such as `Pr_15_31_04_02`, `Pr_15_31_04_XX`, etc.
+  - Live cache writes store the section entry and mirrored entries for each child code, so downstream matching and resume work as before.
+- The classifier receives facet context in the prompt (e.g., `Facet: PR (Products) | Section: Pr_15_31_04`) to improve label quality, especially when Uniclass titles are brief.
 - Label gating: Candidate generation compares IFC labels to Uniclass labels and penalizes or excludes mismatches.
   - Configure in `config/settings.yaml` under `matching`:
     - `discipline_filter`: `none | soft | hard`
@@ -52,10 +63,15 @@ This repository establishes structured mappings between Uniclass 2015 classifica
 - `--classify-timeout`: Per-call timeout seconds (0 = use `rerank.timeout_s`).
 - `--classify-warmup-timeout`: Timeout seconds for the initial model load.
 - `--classify-sleep`: Sleep seconds between calls (simple rate limiting).
+- `--classify-skip-cached` / `--no-classify-skip-cached`: Skip items already present in `output/taxonomy_cache.json` (default) or force reclassification of all.
+- `--debug`: Log prompts and request metadata sent to the AI backend (useful to verify inputs during troubleshooting).
 
 Notes:
-- The classifier uses the same Ollama endpoint configured for reranking (`rerank.endpoint`).
-- The cache is id-keyed: `ifc:<IfcId>` and `uc:<Code>`, with values as arrays of uppercased labels.
+
+- Backend: defaults to Ollama; pass `--openai` to use OpenAI.
+- Models: classification uses `rerank.model` (Ollama) or `rerank.openai_model` (OpenAI). You can override with `--classify-model`.
+- Cache keys: `ifc:<IfcId>` and `uc:<Code>`, values are arrays of uppercased labels.
+- Resume: re-running with the same cache skips completed items by default; use `--no-classify-skip-cached` or delete the file to reclassify all.
 - Matching honors `matching.discipline_source` to pick `heuristic`, `llm`, or `llm_then_heuristic` when labels are present.
 
 #### Quick Examples
@@ -108,7 +124,8 @@ Notes:
 ## CLI Reference
 
 - `--load`                Load IFC + Uniclass into DB (upsert)
-- `--embed`               Generate and store embeddings via Ollama
+- `--embed`               Generate and store embeddings via AI backend
+- `--openai`              Use OpenAI for embedding, classification, and reranking (default is Ollama)
 - `--candidates`          Generate candidate mappings and auto-accept above threshold
 - `--export`              Export accepted mappings to `viewer_mapping.json`
 - `--classify-disciplines` Classify IFC + Uniclass into labels (disciplines/subjects) via LLM; writes `output/taxonomy_cache.json`
@@ -178,6 +195,29 @@ Tips:
 - Embeddings: If you change model or embedded text format, clear old rows and re-embed:
   - `DELETE FROM text_embedding WHERE entity_type IN ('ifc','uniclass');`
   - Ensure `embedding.expected_dim` matches your model (e.g., 1024 for `mxbai-embed-large`).
+
+### AI Backends: Ollama and OpenAI
+
+- Default backend is Ollama. Add `--openai` to use OpenAI.
+- Model selection per backend (configure in `config/settings.yaml`):
+  - Embeddings: `embedding.model` (Ollama) vs `embedding.openai_model` (OpenAI).
+    - If using OpenAI embeddings, set `embedding.openai_expected_dim` to the correct vector size (e.g., 1536 for `text-embedding-3-small`).
+  - Rerank/Classification: `rerank.model` (Ollama) vs `rerank.openai_model` (OpenAI).
+- Environment for OpenAI:
+  - `.env` must include `OPENAI_API_KEY=sk-...`
+  - Optional: `OPENAI_BASE_URL` (for Azure/proxy).
+  - Optional overrides: `OPENAI_EMBED_MODEL`, `OPENAI_EMBED_EXPECTED_DIM`, `OPENAI_RERANK_MODEL`.
+
+Quick OpenAI usage
+
+- Install SDK in your venv: `pip install openai`
+- Set models in config: `embedding.openai_model: text-embedding-3-small`, `rerank.openai_model: gpt-4o-mini`.
+- Run: `py etl/etl_map.py --config config/settings.yaml --classify-disciplines --openai`
+
+Live taxonomy cache
+
+- Classification live-writes to `output/taxonomy_cache.json` periodically and on completion.
+- Re-run classification to resume; cached entries are skipped. Delete the file to force a full refresh.
 
 ## Current State Summary
 

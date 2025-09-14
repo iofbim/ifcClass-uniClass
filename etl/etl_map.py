@@ -336,11 +336,9 @@ def _parse_rerank_json(text: str) -> List[Tuple[str, float]]:
 
 ALLOWED_LABELS = [
     # AECO disciplines
-    "ARCH","STRUCT","CIVIL","MECH","PLUMB","ELEC","ICT","MAINT",
-    # Subjects / roles
-    "ROLE","PM","ACTIVITIES","COMPLEX",
-    # Uniclass table facets (minus ZZ)
-    "AC","CO","EF","EN","FI","MA","PC","PM","PR","RK","RO","SL","SS",
+    "ARCH", "STRUCT", "CIVIL", "MECH", "PLUMB", "ELEC", "ICT", "MAINT",
+    # Subjects / roles (used for IFC subject tagging)
+    "ROLE","PM","ACTIVITIES","COMPLEX", "ENTITIES", "FORMSOFINFORMATION", "MATERIALS", "PROPERTIESANDCHARACTERISTICS", "ELEMENTSANDFUNCTIONS", "PRODUCTS", "RISK", "SPACE/LOCATIONS", "SYSTEMS", "TOOLSANDEQUIPMENT"
 ]
 
 def _format_label_prompt(item_type: str, identifier: str, title: str, description: str, extra: str = "") -> str:
@@ -365,24 +363,70 @@ def _parse_label_array(text: Optional[str]) -> List[str]:
     if not text:
         return []
     try:
-        # Extract first JSON array
+        # Extract first JSON-ish array with normalization
         import re
-        m = re.search(r"\[(?:.|\n)*\]", text)
-        s = m.group(0) if m else text
+        s = text
+        # Normalize curly quotes and stray unicode to plain ASCII quotes to help JSON parser
+        s = s.replace("\u201C", '"').replace("\u201D", '"').replace("\u2018", "'").replace("\u2019", "'")
+        s = s.replace("“", '"').replace("”", '"').replace("’", "'")
+        # Strip JS-style comments that some models append
+        s = re.sub(r"//.*", "", s)
+        # Extract first bracketed array
+        m = re.search(r"\[(?:.|\n)*?\]", s)
+        if m:
+            s = m.group(0)
         arr = json.loads(s)
-        if not isinstance(arr, list):
-            return []
-        out = []
-        for v in arr:
-            if isinstance(v, str):
-                val = v.strip().upper()
-                if val in ALLOWED_LABELS:
-                    out.append(val)
+        if isinstance(arr, list):
+            out = []
+            for v in arr:
+                if isinstance(v, str):
+                    val = v.strip().upper()
+                    if val in ALLOWED_LABELS:
+                        out.append(val)
+            # Dedup preserve order
+            seen = set(); res = []
+            for v in out:
+                if v not in seen:
+                    res.append(v); seen.add(v)
+            return res
+    except Exception:
+        pass
+    # Fallback: heuristic extraction from free text
+    try:
+        t = (text or "").upper()
+        # Map common variants to allowed labels
+        synonyms = {
+            "PROJECT MANAGEMENT": "PM",
+            "PROJECT-MANAGEMENT": "PM",
+            "PM": "PM",
+            "TASK": "ACTIVITIES",
+            "TASKS": "ACTIVITIES",
+            "OPERATION": "ACTIVITIES",
+            "OPERATIONS": "ACTIVITIES",
+            "MAINTENANCE": "MAINT",
+            "MECHANICAL": "MECH",
+            "ELECTRICAL": "ELEC",
+            "PLUMBING": "PLUMB",
+            "STRUCTURAL": "STRUCT",
+            "ARCHITECTURE": "ARCH",
+            "ARCHITECTURAL": "ARCH",
+            "INFORMATION TECHNOLOGY": "ICT",
+            "INFORMATION AND COMMUNICATIONS TECHNOLOGY": "ICT",
+        }
+        found: List[str] = []
+        # Exact label hits first
+        for lab in ALLOWED_LABELS:
+            if lab in t:
+                found.append(lab)
+        # Synonym hits
+        for k, v in synonyms.items():
+            if k in t and v not in found:
+                found.append(v)
         # Dedup preserve order
-        seen = set()
         res = []
-        for v in out:
-            if v not in seen:
+        seen = set()
+        for v in found:
+            if v in ALLOWED_LABELS and v not in seen:
                 res.append(v); seen.add(v)
         return res
     except Exception:
@@ -400,15 +444,76 @@ def classify_items_with_llm(
     sleep_between: float = 0.0,
     max_retries: int = 2,
     provider: str = "ollama",
+    cache_path: Optional[Path] = None,
+    flush_every: int = 50,
+    skip_cached: bool = True,
+    alias_map: Optional[Dict[str, List[str]]] = None,  # master_code -> list of alias codes to mirror
+    extras_map: Optional[Dict[str, str]] = None,        # key -> extra context for prompt
+    debug: bool = False,
 ) -> Dict[str, List[str]]:
-    """Classify items via Ollama or OpenAI, with retries and basic rate limiting."""
-    out: Dict[str, List[str]] = {}
+    """Classify items via Ollama or OpenAI, with retries and basic rate limiting.
+
+    When cache_path is provided, this function will:
+      - Load existing taxonomy cache
+      - Skip items already present (if skip_cached=True)
+      - Write incremental updates to cache after every flush_every items
+    """
+    # Load existing cache when live-updating
+    existing: Dict[str, List[str]] = {}
+    if cache_path is not None:
+        try:
+            existing = _load_taxonomy_cache(cache_path)
+        except Exception:
+            existing = {}
+    out: Dict[str, List[str]] = dict(existing) if existing else {}
+    # If alias_map provided and we already have master entries, propagate to aliases
+    if alias_map and out and cache_path is not None:
+        changed = False
+        for master, aliases in alias_map.items():
+            mkey = f"uc:{master}"
+            labs = out.get(mkey)
+            if not labs:
+                continue
+            for a in (aliases or []):
+                akey = f"uc:{a}"
+                if akey not in out:
+                    out[akey] = list(labs)
+                    changed = True
+        if changed:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"[classify] cache propagate error: {e}")
     # Warm up Ollama once to load the model
     if (provider or "ollama").lower() != "openai":
         _ollama_warmup(model=model, endpoint=endpoint, timeout_s=warmup_timeout_s)
     from time import sleep
-    for idx, (key, item_type, title, desc) in enumerate(items, start=1):
-        prompt = _format_label_prompt(item_type, key, title or "", desc or "")
+    # Optionally filter items that are already in cache
+    work_items = items
+    if skip_cached and out:
+        work_items = [(k, t, ti, d) for (k, t, ti, d) in items if k not in out]
+    total = len(work_items)
+    done = 0
+    for idx, (key, item_type, title, desc) in enumerate(work_items, start=1):
+        extra = ""
+        if extras_map is not None:
+            extra = str(extras_map.get(key, "") or "")
+        prompt = _format_label_prompt(item_type, key, title or "", desc or "", extra=extra)
+        if debug:
+            try:
+                title_preview = (title or "").replace("\n"," ")
+                if len(title_preview) > 100:
+                    title_preview = title_preview[:100] + "..."
+                desc_used = bool((desc or "").strip())
+                desc_len = len((desc or "").strip())
+                extra_preview = (extra or "").replace("\n"," ")
+                if len(extra_preview) > 120:
+                    extra_preview = extra_preview[:120] + "..."
+                print(f"[debug.classify] key={key} type={item_type} desc_used={desc_used} desc_len={desc_len} title=\"{title_preview}\" extra=\"{extra_preview}\"")
+            except Exception:
+                pass
         resp: Optional[str] = None
         for attempt in range(max(1, int(max_retries) + 1)):
             tmo = float(timeout_s) * (1.5 ** attempt)
@@ -422,10 +527,31 @@ def classify_items_with_llm(
                 sleep(min(2.0, float(sleep_between)))
         labels = _parse_label_array(resp)
         out[key] = labels
+        # If key is a Uniclass master and alias_map provided, propagate to aliases
+        if alias_map and key.startswith("uc:"):
+            base = key.split(":",1)[1]
+            for a in (alias_map.get(base) or []):
+                out[f"uc:{a}"] = list(labels)
+        done += 1
+        if cache_path is not None and (flush_every <= 1 or (done % int(max(1, flush_every)) == 0)):
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                print(f"[classify] cache write error: {e}")
         if progress_every and idx % int(progress_every) == 0:
-            print(f"[classify] progress: {idx}/{len(items)}")
+            print(f"[classify] progress: {idx}/{total}")
         if sleep_between > 0:
             sleep(float(sleep_between))
+    # Final flush
+    if cache_path is not None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(out, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[classify] cache final write error: {e}")
     return out
 
 def _load_taxonomy_cache(path: Optional[Path] = None) -> Dict[str, List[str]]:
@@ -967,11 +1093,10 @@ def read_uniclass_csvs(csvs: Dict[str, Path], revision: str) -> pd.DataFrame:
             "code": df[code_col].astype(str),
             "facet": str(facet).upper(),
             "title": df[title_col].astype(str),
-            "description": "",
             "revision": revision,
         }))
     if not frames:
-        return pd.DataFrame(columns=["code","facet","title","description","revision"]) 
+        return pd.DataFrame(columns=["code","facet","title","revision"]) 
     return pd.concat(frames, ignore_index=True).drop_duplicates(subset=["code"]) 
 
 
@@ -1083,14 +1208,13 @@ def read_uniclass_xlsx_dir(dir_path: Path, revision: str) -> pd.DataFrame:
             "code": df[code_col].astype(str).str.strip(),
             "facet": fval,
             "title": df[title_col].astype(str).str.strip(),
-            "description": "",
             "revision": revision,
         }
         if ifc_map_series is not None:
             base["ifc_mappings"] = ifc_map_series
         frames.append(pd.DataFrame(base))
     if not frames:
-        return pd.DataFrame(columns=["code","facet","title","description","revision"]) 
+        return pd.DataFrame(columns=["code","facet","title","revision"]) 
     out = pd.concat(frames, ignore_index=True)
     # If facet was empty, try infer from code prefix before first underscore
     mask = out["facet"] == ""
@@ -1141,24 +1265,23 @@ def upsert_uniclass(conn: psycopg.Connection, df: pd.DataFrame):
             CREATE TEMP TABLE tmp_uc AS SELECT * FROM uniclass_item WITH NO DATA;
             """
         )
-        cols = ["code","facet","title","description","revision"]
+        cols = ["code","facet","title","revision"]
         csv_bytes = df[cols].to_csv(index=False, header=False).encode("utf-8")
         with cur.copy(
-            "COPY tmp_uc (code,facet,title,description,revision) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)"
+            "COPY tmp_uc (code,facet,title,revision) FROM STDIN WITH (FORMAT CSV, HEADER FALSE)"
         ) as cp:
             cp.write(csv_bytes)
         cur.execute(
             """
-            INSERT INTO uniclass_item AS u (code,facet,title,description,revision)
-            SELECT code,facet,title,description,revision FROM tmp_uc
+            INSERT INTO uniclass_item AS u (code,facet,title,revision)
+            SELECT code,facet,title,revision FROM tmp_uc
             ON CONFLICT (code) DO UPDATE
             SET facet = EXCLUDED.facet,
                 title = EXCLUDED.title,
-                description = EXCLUDED.description,
                 revision = EXCLUDED.revision;
             -- Also record a historical snapshot per (code, revision)
-            INSERT INTO uniclass_item_revision (code, revision, facet, title, description)
-            SELECT code, revision, facet, title, description FROM tmp_uc
+            INSERT INTO uniclass_item_revision (code, revision, facet, title)
+            SELECT code, revision, facet, title FROM tmp_uc
             ON CONFLICT (code, revision) DO NOTHING;
             DROP TABLE tmp_uc;
             """
@@ -1276,15 +1399,14 @@ def generate_candidates(
                     else:
                         mult *= float(disc_penalty)
             s = score_pair(q, u["norm_title"]) * mult
-            scores.append((u["code"], fac, u["title"], u["description"], float(s)))
+            scores.append((u["code"], fac, u["title"], float(s)))
         scores.sort(key=lambda x: x[4], reverse=True)
-        for code, facet, title, udesc, s in scores[:top_k]:
+        for code, facet, title, s in scores[:top_k]:
             rows.append({
                 "ifc_id": ifc_id,
                 "code": code,
                 "facet": facet,
                 "uniclass_title": title,
-                "uniclass_description": udesc,
                 "score": round(s, 4),
             })
     return pd.DataFrame(rows)
@@ -1443,10 +1565,9 @@ def generate_candidates_blended(
         code = str(r["code"])
         facet = r["facet"]
         title = r["title"]
-        desc = r.get("description", "")
         maps_raw = str(r.get("ifc_mappings", "") or "")
         map_set = set([m for m in maps_raw.split(";") if m])
-        uc_info[code] = (facet, title, desc, map_set)
+        uc_info[code] = (facet, title, map_set)
     # Fast lookup for normalized titles by code, avoid .loc in tight loops
     code_to_norm = pd.Series(uc_work["norm_title"].values, index=uc_work["code"].astype(str)).to_dict()
     uc_disc_map = pd.Series(uc_work["disciplines"].values, index=uc_work["code"].astype(str)).to_dict()
@@ -1588,7 +1709,7 @@ def generate_candidates_blended(
             lex = lex_scores.get(code, 0.0)
             emb = emb_scores.get(code, 0.0)
             # Retrieve Uniclass facet/title for this code first
-            ufacet, title, udesc, umaps = uc_info.get(code, ("", "", "", set()))
+            ufacet, title, umaps = uc_info.get(code, ("", "", set()))
             # Apply feature multiplier as post-combination adjuster
             mult = _feature_multiplier(ufacet, flags_map.get(str(ifc_id), {}), {
                 "pr_predefined_type": 0.10, "pr_manufacturer_ps": 0.10, "ss_group_system": 0.10, "type_bias": 0.05, "pset_count_scale": 0.002, "max_pset_boost": 0.25
@@ -1612,15 +1733,14 @@ def generate_candidates_blended(
                 else:
                     if str(ifc_id) in umaps:
                         final = min(1.0, final + anchor_bonus)
-            scored.append((code, ufacet, title, udesc, float(final)))
-        scored.sort(key=lambda x: x[4], reverse=True)
-        for code, facet, title, udesc, s in scored[:top_k]:
+            scored.append((code, ufacet, title, float(final)))
+        scored.sort(key=lambda x: x[3], reverse=True)
+        for code, facet, title, s in scored[:top_k]:
             rows.append({
                 "ifc_id": ifc_id,
                 "code": code,
                 "facet": facet,
                 "uniclass_title": title,
-                "uniclass_description": udesc,
                 "score": round(s, 4),
             })
     return pd.DataFrame(rows)
@@ -1834,7 +1954,6 @@ def generate_candidates_uc2ifc_blended(
                 "code": code,
                 "facet": facet,
                 "uniclass_title": title,
-                "uniclass_description": u.get("description", ""),
                 "score": round(s, 4),
             })
     return pd.DataFrame(rows)
@@ -1983,6 +2102,11 @@ def main():
     ap.add_argument("--classify-timeout", type=float, default=0.0, help="Per-call timeout seconds (0 = use rerank.timeout_s)")
     ap.add_argument("--classify-warmup-timeout", type=float, default=180.0, help="Warmup timeout seconds for first model load")
     ap.add_argument("--classify-sleep", type=float, default=0.0, help="Sleep seconds between calls for rate limiting")
+    ap.add_argument("--debug", action="store_true", help="Log prompts and request metadata sent to the AI backend")
+    # Resume control: skip already cached items (default true); allow override via --no-classify-skip-cached
+    ap.add_argument("--classify-skip-cached", dest="classify_skip_cached", action="store_true", help="Skip items already in output/taxonomy_cache.json (default)")
+    ap.add_argument("--no-classify-skip-cached", dest="classify_skip_cached", action="store_false", help="Do not skip cached items; reclassify all")
+    ap.set_defaults(classify_skip_cached=True)
     args = ap.parse_args()
 
     s = load_settings(Path(args.config))
@@ -2023,18 +2147,42 @@ def main():
                 title = str(r.get("label", ""))
                 desc = str(r.get("aug_text") or r.get("description") or "")
                 items.append((f"ifc:{iid}", "IFC", title, desc))
-        # Uniclass items
+        # Uniclass items: classify at Section level (Facet_Group_Subgroup_Section) and propagate to child codes
+        alias_map: Dict[str, List[str]] = {}
+        extras_map: Dict[str, str] = {}
         if scope in ("both", "uniclass"):
+            def _section_key(code: str) -> str:
+                parts = str(code or "").split("_")
+                return "_".join(parts[:4]) if len(parts) >= 4 else str(code or "")
+            def _facet_name(facet: str) -> str:
+                m = {
+                    'AC': 'Activities', 'PM': 'Project Management', 'PR': 'Products', 'SS': 'Systems',
+                    'EF': 'Elements/Functions', 'EN': 'Entities', 'FI': 'Forms of Information', 'MA': 'Materials',
+                    'PC': 'Properties and Characteristics', 'RK': 'Risk', 'RO': 'Roles', 'SL': 'Spaces/Locations',
+                    'CO': 'Complexes', 'TE': 'Tools and Equipment', 'ZZ': 'Unassigned'
+                }
+                return m.get(facet.upper(), facet)
             uc_src = uc_df
             if facet_filter:
                 uc_src = uc_src[uc_src["facet"].astype(str).str.upper().isin(facet_filter)]
+            reps: Dict[str, Tuple[str, str]] = {}
             for _, r in uc_src.iterrows():
                 code = str(r.get("code", ""))
                 if not code:
                     continue
+                sec = _section_key(code)
+                alias_map.setdefault(sec, []).append(code)
                 title = str(r.get("title", ""))
-                desc = str(r.get("description", ""))
-                items.append((f"uc:{code}", "Uniclass", title, desc))
+                # Many Uniclass rows have empty or unhelpful descriptions; omit to improve model reliability
+                desc = ""
+                facet = str(r.get("facet", ""))
+                if sec and sec not in extras_map:
+                    extras_map[f"uc:{sec}"] = f"Facet: {facet} ({_facet_name(facet)}) | Section: {sec}"
+                # Prefer exact section row if present; otherwise keep first seen child
+                if code == sec or not reps.get(sec):
+                    reps[sec] = (title, desc)
+            for sec, (title, desc) in reps.items():
+                items.append((f"uc:{sec}", "Uniclass", title, desc))
         if int(args.classify_limit or 0) > 0:
             items = items[: int(args.classify_limit)]
         # Choose model based on backend; args.classify_model overrides
@@ -2046,7 +2194,8 @@ def main():
         per_call_timeout = float(args.classify_timeout or 0.0) or float(s.rerank_timeout_s) or 45.0
         backend = "openai" if args.openai else "ollama"
         target = ("OpenAI" if backend == "openai" else s.rerank_endpoint)
-        print(f"[classify] Classifying {len(items)} items using {c_model} via {backend} ({target})")
+        out_path = s.output_dir / "taxonomy_cache.json"
+        print(f"[classify] Classifying {len(items)} section items using {c_model} via {backend} ({target}); live-writing to {out_path}")
         labels_map = classify_items_with_llm(
             items,
             model=c_model,
@@ -2059,12 +2208,15 @@ def main():
             sleep_between=float(args.classify_sleep or 0.0),
             max_retries=2,
             provider=backend,
+            cache_path=out_path,
+            flush_every=25,
+            skip_cached=bool(getattr(args, 'classify_skip_cached', True)),
+            alias_map=alias_map,
+            extras_map=extras_map,
+            debug=bool(getattr(args, 'debug', False)),
         )
-        out_path = s.output_dir / "taxonomy_cache.json"
-        s.output_dir.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(labels_map, f, ensure_ascii=False, indent=2)
-        print(f"[classify] Wrote {out_path}")
+        # A final confirmation message; file was live-written during the run
+        print(f"[classify] Live-updated {out_path} with {len(labels_map)} entries")
         # Exit early if only classification requested
         if not (args.load or args.candidates or args.export or args.embed or args.reset_mappings):
             return

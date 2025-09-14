@@ -10,7 +10,7 @@ ifc:
   use_parent_context: true
 
 uniclass:
-  revision: 2025-07
+  revision: 2025-09
   autodetect_revision: true
   enforce_monotonic_revision: true
   # Prefer this: auto-discover all .xlsx in folder
@@ -80,7 +80,7 @@ embedding:
 
 rerank:
   top_n: 0
-  model: llama3.2
+  model: mistral:7b-instruct
   # OpenAI-specific chat model when using --openai (e.g., gpt-4o-mini)
   openai_model: gpt-4o-mini
   endpoint: http://localhost:11434

@@ -15,7 +15,6 @@ CREATE TABLE IF NOT EXISTS uniclass_item (
   code TEXT PRIMARY KEY,
   facet TEXT NOT NULL,
   title TEXT NOT NULL,
-  description TEXT,
   revision TEXT NOT NULL
 );
 
@@ -25,7 +24,6 @@ CREATE TABLE IF NOT EXISTS uniclass_item_revision (
   revision TEXT NOT NULL,
   facet TEXT NOT NULL,
   title TEXT NOT NULL,
-  description TEXT,
   inserted_at TIMESTAMPTZ DEFAULT now(),
   PRIMARY KEY (code, revision)
 );

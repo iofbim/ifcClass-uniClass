@@ -10,7 +10,7 @@ ifc:
   use_parent_context: true
 
 uniclass:
-  revision: 2025-07
+  revision: 2025-09
   autodetect_revision: true
   enforce_monotonic_revision: true
   # Prefer this: auto-discover all .xlsx in folder
@@ -45,7 +45,7 @@ matching:
   discipline_source: llm_then_heuristic
   # Convenience: list facets to skip entirely during matching
   # Focus only on PR facet; skip everything else
-  skip_tables: [AC, CO, EF, EN, FI, MA, PC, PM, RK, RO, SL, SS, ZZ, TE]
+  # skip_tables: [AC, CO, EF, EN, FI, MA, PC, PM, RK, RO, SL, SS, ZZ, TE]
   # Optional facet-aware rules to constrain candidates
   # - skip: true            -> ignore the entire facet
   # - abstract_only: true   -> allow only abstract IFC classes
@@ -70,7 +70,7 @@ embedding:
   model: mxbai-embed-large
   endpoint: http://localhost:11434
   batch_size: 16
-  timeout_s: 30
+  timeout_s: 200
   # 1024 for mxbai-embed-large and bge-m3; 768 for jina-embeddings-v2-base-en
   expected_dim: 1024
   # OpenAI-specific embedding model and expected dim when using --openai
@@ -85,11 +85,11 @@ embedding:
 
 rerank:
   top_n: 5
-  model: llama3.1:8b
+  model: mistral:7b-instruct
   # OpenAI-specific chat model when using --openai (e.g., gpt-4o-mini)
   openai_model: gpt-4o-mini
   endpoint: http://localhost:11434
-  temperature: 0
+  temperature: 0.2
   max_tokens: 512
   fewshot_per_facet: 3
-  timeout_s: 20
+  timeout_s: 210
