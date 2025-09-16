@@ -1,4 +1,4 @@
--- Schema for IFC ↔ Uniclass mapping (versioned, typed edges)
+-- Schema for IFC <-> Uniclass mapping (versioned, typed edges)
 -- Requires: Postgres 14+; optional pgvector
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto; -- for gen_random_uuid
@@ -46,6 +46,78 @@ CREATE INDEX IF NOT EXISTS idx_te_uniclass_ivfflat
   WITH (lists = 100)
   WHERE entity_type = 'uniclass';
 
+
+-- Normalized feature key/value pairs for structured matching
+CREATE TABLE IF NOT EXISTS ifc_feature (
+  ifc_id TEXT NOT NULL REFERENCES ifc_class(ifc_id) ON DELETE CASCADE,
+  feature_key TEXT NOT NULL,
+  feature_value TEXT NOT NULL,
+  source TEXT,
+  confidence NUMERIC DEFAULT 1 CHECK (confidence BETWEEN 0 AND 1),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (ifc_id, feature_key, feature_value)
+);
+CREATE INDEX IF NOT EXISTS idx_ifc_feature_key ON ifc_feature(feature_key);
+CREATE INDEX IF NOT EXISTS idx_ifc_feature_value ON ifc_feature(feature_value);
+
+CREATE TABLE IF NOT EXISTS uniclass_feature (
+  code TEXT NOT NULL REFERENCES uniclass_item(code) ON DELETE CASCADE,
+  feature_key TEXT NOT NULL,
+  feature_value TEXT NOT NULL,
+  source TEXT,
+  confidence NUMERIC DEFAULT 1 CHECK (confidence BETWEEN 0 AND 1),
+  created_at TIMESTAMPTZ DEFAULT now(),
+  PRIMARY KEY (code, feature_key, feature_value)
+);
+CREATE INDEX IF NOT EXISTS idx_uc_feature_key ON uniclass_feature(feature_key);
+CREATE INDEX IF NOT EXISTS idx_uc_feature_value ON uniclass_feature(feature_value);
+-- Historical record of candidate scores per generation run
+CREATE TABLE IF NOT EXISTS ifc_uniclass_candidate_history (
+  history_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  run_id UUID NOT NULL,
+  generated_at TIMESTAMPTZ DEFAULT now(),
+  ifc_id TEXT NOT NULL REFERENCES ifc_class(ifc_id) ON DELETE CASCADE,
+  code TEXT NOT NULL REFERENCES uniclass_item(code) ON DELETE CASCADE,
+  facet TEXT,
+  score NUMERIC,
+  lexical_score NUMERIC,
+  embedding_score NUMERIC,
+  feature_multiplier NUMERIC,
+  discipline_multiplier NUMERIC,
+  token_overlap_multiplier NUMERIC,
+  anchor_applied BOOLEAN,
+  direction TEXT,
+  source_ifc_version TEXT,
+  source_uniclass_revision TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_history_run ON ifc_uniclass_candidate_history(run_id);
+CREATE INDEX IF NOT EXISTS idx_candidate_history_facet ON ifc_uniclass_candidate_history(facet);
+
+-- Reviewer feedback captured per IFC <-> Uniclass pair
+CREATE TABLE IF NOT EXISTS review_decision (
+  decision_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ifc_id TEXT NOT NULL REFERENCES ifc_class(ifc_id) ON DELETE CASCADE,
+  code TEXT NOT NULL REFERENCES uniclass_item(code) ON DELETE CASCADE,
+  relation_type TEXT,
+  decision TEXT NOT NULL CHECK (decision IN ('accept','reject','needs_review')),
+  reviewer TEXT,
+  notes TEXT,
+  decided_at TIMESTAMPTZ DEFAULT now(),
+  run_id UUID,
+  score NUMERIC,
+  lexical_score NUMERIC,
+  embedding_score NUMERIC,
+  feature_multiplier NUMERIC,
+  discipline_multiplier NUMERIC,
+  token_overlap_multiplier NUMERIC,
+  anchor_applied BOOLEAN,
+  facet TEXT,
+  source_uniclass_revision TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_review_decision_pair ON review_decision(ifc_id, code);
+CREATE INDEX IF NOT EXISTS idx_review_decision_facet ON review_decision(facet);
+CREATE INDEX IF NOT EXISTS idx_review_decision_revision ON review_decision(source_uniclass_revision);
+
 CREATE TABLE IF NOT EXISTS ifc_uniclass_map (
   map_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   ifc_id TEXT REFERENCES ifc_class(ifc_id) ON DELETE CASCADE,
@@ -68,3 +140,5 @@ CREATE INDEX IF NOT EXISTS idx_uniclass_revision ON uniclass_item(revision);
 CREATE INDEX IF NOT EXISTS idx_map_ifc ON ifc_uniclass_map(ifc_id);
 CREATE INDEX IF NOT EXISTS idx_map_code ON ifc_uniclass_map(code);
 CREATE INDEX IF NOT EXISTS idx_map_type ON ifc_uniclass_map(relation_type);
+
+

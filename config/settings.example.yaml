@@ -1,4 +1,4 @@
- # Note: etl/etl_map.py will use DATABASE_URL or POSTGRES_* from the environment if set.
+﻿ # Note: etl/etl_map.py will use DATABASE_URL or POSTGRES_* from the environment if set.
 # This db_url acts as a fallback.
 db_url: postgresql://postgres:postgres@localhost:5432/iob_knowledge
 
@@ -61,6 +61,19 @@ matching:
     - ["pipe","piping"]
     - ["duct","ductwork"]
 
+features:
+  enabled: true
+  attribute_tokens: []  # optional additional keywords for attribute columns
+
+# Evaluation + regression guardrails
+evaluation:
+  baseline_run_id: null  # optional UUID of past run to compare against
+  max_precision_drop: 0.05  # fail if precision drop exceeds this value
+  min_recall: 0.70          # fail if recall falls below this floor
+  accept_threshold: 0.70    # score threshold regarded as positive in evaluation
+  fail_on_regression: false
+
+
 embedding:
   model: mxbai-embed-large
   endpoint: http://localhost:11434
@@ -88,4 +101,8 @@ rerank:
   max_tokens: 512
   fewshot_per_facet: 3
   timeout_s: 10
+
+
+
+
 

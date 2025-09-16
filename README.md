@@ -1,228 +1,134 @@
-# ifcClass-uniClass
+﻿# ifcClass-uniClass
 
-This repository establishes structured mappings between Uniclass 2015 classification tables and IFC 4x3 schema classes.
+A reproducible pipeline for aligning IFC 4x3 entities with Uniclass 2015 classifications using Postgres, hybrid similarity scoring, and optional LLM assistance.
 
-## Overview
+## What this project delivers
 
-- Goal: Load IFC classes and Uniclass tables into Postgres, generate candidate mappings with lexical + vector similarity, optionally re-rank with a local LLM, and export a JSON for a viewer.
-- Core: `etl/etl_map.py` orchestrates loading, embeddings, candidate generation, optional LLM re-rank, and export via CLI flags.
-- Schema: `sql/schema.sql` defines tables (`ifc_class`, `uniclass_item`, `uniclass_item_revision`, `ifc_uniclass_map`, `text_embedding`) and enables `pgcrypto` and `vector` (pgvector).
+- Normalized Postgres schema (`sql/schema.sql`) capturing IFC classes, Uniclass items, embeddings, anchors, and accepted relationships.
+- Single CLI entrypoint (`etl/etl_map.py`) that orchestrates loading, embedding, classification, candidate generation, re-ranking, and export.
+- Hybrid scoring that blends lexical similarity, pgvector nearest neighbours, Uniclass-provided IFC anchors, and discipline labels.
+- Incremental discipline/subject tagging with a cached taxonomy (`output/taxonomy_cache.json`) to gate candidates and reduce repeated LLM calls.
+- Exportable viewer payloads in `output/viewer_mapping.json` for downstream review tooling or visualization layers.
+- Structured feature caches in `ifc_feature` and `uniclass_feature` tables for property-level alignment.
+- Logged candidate runs and reviewer feedback (`ifc_uniclass_candidate_history`, `review_decision`) for downstream evaluation and regression checks.
 
-## Data Model
+## Repository layout
 
-- IFC: Classes with `ifc_id`, `schema_version`, `label`, `description`.
-- Uniclass: Items with `code`, `facet` (EF/SS/PR/... inferred), `title`, `description`, `revision`.
-  - Note: `description` is intentionally not used by the pipeline and is stored empty; prompts and embeddings rely on title + facet/section context.
-- Mappings: `ifc_uniclass_map` stores edges with `relation_type` (typical_of, part_of, equivalent), `confidence`, and provenance (IFC version, Uniclass revision).
+- `etl/etl_map.py` – main orchestration script with helpers for embedding, classification, candidate generation, and export.
+- `config/settings.yaml` – active configuration; `settings.example.yaml` documents defaults and optional tweaks.
+- `sql/schema.sql` – Postgres schema, extensions (`pgcrypto`, `vector`), indexes, and helper views.
+- `Samples/` – example IFC JSON and Uniclass spreadsheets for development and testing.
+- `output/viewer_mapping.json` – generated mapping for viewers; `output/taxonomy_cache.json` – cached LLM discipline labels.
+- `scripts/` – utility notebooks/scripts for diagnostics (if provided, not required for core flow).
 
-## ETL Flow
+## End-to-end flow
 
-- Load (`--load`): Upserts IFC classes and Uniclass items.
-- Embed (`--embed`): Generates embeddings with the selected AI backend and stores in `text_embedding`.
-  - IFC text: identifier + description/definition with parent-chain context (optional), plus compact feature hints (e.g., role, kind, psets).
-  - Uniclass text: enriched with `[FACET] Code tokens: Title` (e.g., `[PR] Pr 20 93: Unit structure and general products`).
-  - Recommended embed model: `mxbai-embed-large` (1024‑dim); set `embedding.expected_dim: 1024`.
-- Candidates (`--candidates`):
-  - Lexical: fuzzy match between normalized IFC text and Uniclass titles, filtered by facet rules.
-  - Vector blend: nearest neighbors via pgvector using cosine distance (consistent rank + score), blended by `matching.embedding_weight`.
-  - Anchor guidance: if Uniclass XLSX includes IFC mapping columns (e.g., “IFC 4x3”), extracted `ifc_mappings` boost those IFCs (or ancestors) by `matching.anchor_bonus`.
-  - Direction: `matching.direction` `ifc_to_uniclass` (default) or `uniclass_to_ifc` (ensures every Uniclass gets candidates from IFC).
-  - Auto-accept: rows above `matching.auto_accept_threshold` are written to `ifc_uniclass_map` (confidence clamped to [0,1]).
-- Re-rank (optional): If `rerank.top_n > 0`, per-item top‑N are re-scored by a local LLM (Ollama) using few-shot examples from the extracted anchors per facet.
-- Export (`--export`): Writes `output/viewer_mapping.json` summarizing accepted mappings.
+1. **Configure** – ensure `config/settings.yaml` points to the IFC JSON, Uniclass source, and database. Environment variables in `.env` or your shell override equivalent values.
+2. **Load source data**  
+   `py etl/etl_map.py --config config/settings.yaml --load`  
+   Upserts IFC classes (`ifc_class`) and Uniclass items (`uniclass_item` + revisions) while capturing anchors from spreadsheet metadata.
+3. **Generate embeddings**  
+   `py etl/etl_map.py --config config/settings.yaml --embed`  
+   Creates contextualized text for each entity, calls Ollama or OpenAI to embed, and stores vectors in `text_embedding`. Re-run when text formatting or model changes.
+4. **Classify disciplines (optional but recommended)**  
+   `py etl/etl_map.py --config config/settings.yaml --classify-disciplines`  
+   Uses the configured AI backend for multi-label discipline tagging. Section-level Uniclass calls are cached in `output/taxonomy_cache.json` and replayed on subsequent runs.
+5. **Generate candidates**  
+   `py etl/etl_map.py --config config/settings.yaml --candidates`  
+   Produces ranked IFC to Uniclass suggestions, blending lexical scores, embedding distances, feature boosts, anchors, and label gating. Rows above `matching.auto_accept_threshold` are written to `ifc_uniclass_map`.
+   - Set `matching.direction` to `uniclass_to_ifc` to ensure coverage from the Uniclass side.
+   - Use `--reset-mappings` (optionally `--reset-facets PR,SS`) before re-generating to avoid stale rows from older revisions.
+6. **Optional LLM re-rank**  
+   Enable by setting `rerank.top_n > 0` in the config; the CLI will automatically call the reranker during candidate generation to refine ordering inside the top-N shortlist per item.
+7. **Export viewer payload**  
+   `py etl/etl_map.py --config config/settings.yaml --export`  
+   Writes a compact JSON summarising accepted links plus metadata for UI consumption.
 
-### LLM Classification + Label-Guided Matching
+## Classification cache and review workflow
 
-- Classification (`--classify-disciplines`): Uses the configured AI backend to assign multi-label tags to each IFC class and Uniclass item.
-  - Labels include AECO disciplines and subjects: `ARCH, STRUCT, CIVIL, MECH, PLUMB, ELEC, ICT, MAINT, ROLE, PM, ACTIVITIES, COMPLEX`.
-  - Note: Uniclass facet codes (e.g., `PR`, `SS`) are attached internally from the source data and do not need to be produced by the classifier.
-  - Live cache: results are written incrementally to `output/taxonomy_cache.json` and auto-loaded by candidate generation. Subsequent runs skip cached items; delete the file to reclassify all.
+- `output/taxonomy_cache.json` stores discipline labels keyed by entity identifier. Delete the file to force a fresh labelling pass.
+- Cached labels are merged into candidate generation, optionally penalising or removing mismatched disciplines depending on `matching.discipline_filter`.
+- Use the viewer JSON alongside manual QA tools to inspect `confidence`, `relation_type`, and the provenance stored in `ifc_uniclass_map`.
+- The candidate CLI prints a UUID per run and persists the full score breakdown to `ifc_uniclass_candidate_history` for later audit.
+- Record reviewer outcomes in `review_decision` so evaluation runs can compare predictions against curated decisions.
+- Generate precision/recall scorecards with `python scripts/evaluate.py --config config/settings.yaml --run-id <RUN_UUID>` (optionally provide `--baseline-run-id` to compare against a previous run).
 
-Section-level Uniclass classification
+## Configuration highlights
 
-- To reduce cost and keep results consistent, Uniclass items are classified at the Section level and labels are propagated to all child items within that section.
-- Section key = `Facet_Group_Subgroup_Section` (first 4 tokens of the code). Example:
-  - Code `Pr_15_31_04_02` (Acid neutralization products) belongs to section `Pr_15_31_04` (Applied cleaning and treatment products).
-  - The classifier runs once for `uc:Pr_15_31_04` and the resulting labels apply to `Pr_15_31_04` and all descendants such as `Pr_15_31_04_02`, `Pr_15_31_04_XX`, etc.
-  - Live cache writes store the section entry and mirrored entries for each child code, so downstream matching and resume work as before.
-- The classifier receives facet context in the prompt (e.g., `Facet: PR (Products) | Section: Pr_15_31_04`) to improve label quality, especially when Uniclass titles are brief.
-- Label gating: Candidate generation compares IFC labels to Uniclass labels and penalizes or excludes mismatches.
-  - Configure in `config/settings.yaml` under `matching`:
-    - `discipline_filter`: `none | soft | hard`
-    - `discipline_penalty`: penalty multiplier when `soft`
-    - `discipline_source`: `heuristic | llm | llm_then_heuristic`
-  - With `llm_then_heuristic`, LLM labels are used when present; otherwise keyword/ancestor heuristics fill gaps.
+- **Database**: `db_url` (or `DATABASE_URL`) plus optional `POSTGRES_*` fallbacks for convenience.
+- **Features**: toggle structured extraction with `features.enabled` and extend detection keywords via `features.attribute_tokens`.
+- **Evaluation**: configure `evaluation.*` (baseline run, precision drop tolerance, recall floor, acceptance threshold, fail-on-regression) to automate scorecard checks.
+- **IFC input**: `ifc.json_path`, `ifc.schema_version`, and `ifc.use_parent_context` to decide whether ancestor descriptions enrich embedding text.
+- **Uniclass input**: configure an `xlsx_dir` for bulk ingestion or explicit `csv_paths`. `autodetect_revision` and `enforce_monotonic_revision` defend against downgrading revisions.
+- **Matching**:
+  - `top_k`, `embedding_weight`, `embedding_top_k` tune the lexical/vector blend.
+  - `rules` and `skip_tables` gate which IFC roots or facets participate.
+  - `anchor_bonus` and `anchor_use_ancestors` leverage spreadsheet-provided IFC references.
+  - `synonyms` supplies domain-specific term equivalences that augment lexical token sets.
+  - Discipline gating: `discipline_filter`, `discipline_penalty`, and `discipline_source`.
+- **Embedding backend**: Select Ollama or OpenAI models, vector dimensions, batch sizes, and ANN index parameters (`embedding.ivf_lists`, `embedding.ivf_probes`, `embedding.query_timeout_ms`).
+- **Rerank backend**: Configure `rerank.model`, `rerank.top_n`, `fewshot_per_facet`, and timeouts; override with OpenAI equivalents when needed.
+- **Output**: `output.dir` and `output.viewer_json`.
 
-#### Classification CLI Options
+## Running the CLI
 
-- `--classify-disciplines`: Run the classifier and write `output/taxonomy_cache.json`.
-- `--classify-scope`: `both | ifc | uniclass` (default `both`).
-- `--classify-facets`: Comma-separated Uniclass facets to include (e.g., `PR,SS`). Empty = all.
-- `--classify-limit`: Stop after N items (0 = no limit).
-- `--classify-model`: Override model just for classification (defaults to `rerank.model`).
-- `--classify-timeout`: Per-call timeout seconds (0 = use `rerank.timeout_s`).
-- `--classify-warmup-timeout`: Timeout seconds for the initial model load.
-- `--classify-sleep`: Sleep seconds between calls (simple rate limiting).
-- `--classify-skip-cached` / `--no-classify-skip-cached`: Skip items already present in `output/taxonomy_cache.json` (default) or force reclassification of all.
-- `--debug`: Log prompts and request metadata sent to the AI backend (useful to verify inputs during troubleshooting).
-
-Notes:
-
-- Backend: defaults to Ollama; pass `--openai` to use OpenAI.
-- Models: classification uses `rerank.model` (Ollama) or `rerank.openai_model` (OpenAI). You can override with `--classify-model`.
-- Cache keys: `ifc:<IfcId>` and `uc:<Code>`, values are arrays of uppercased labels.
-- Resume: re-running with the same cache skips completed items by default; use `--no-classify-skip-cached` or delete the file to reclassify all.
-- Matching honors `matching.discipline_source` to pick `heuristic`, `llm`, or `llm_then_heuristic` when labels are present.
-
-#### Quick Examples
-
-- Classify all IFC + Uniclass items and stop:
-  - `py etl/etl_map.py --config config/settings.yaml --classify-disciplines`
-- Classify only Uniclass PR/SS and then generate candidates using those labels:
-  - `py etl/etl_map.py --config config/settings.yaml --classify-disciplines --classify-scope uniclass --classify-facets PR,SS`
-  - `py etl/etl_map.py --config config/settings.yaml --candidates`
--
-  Rebuild the cache with a different model and a 30s timeout:
-  - `py etl/etl_map.py --config config/settings.yaml --classify-disciplines --classify-model llama3.2:latest --classify-timeout 30`
-
-## Configuration
-
-- YAML: Copy `config/settings.example.yaml` → `config/settings.yaml` and adjust file paths, thresholds, synonyms.
-- Env precedence: The ETL auto-loads `.env` at repo root and prefers env vars for DB over YAML.
-  - Preferred: `DATABASE_URL=postgresql://USER:PASSWORD@HOST:PORT/DBNAME`
-  - Alternative: `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`
-  - Fallback: `db_url` from YAML if env not set.
-
-### Uniclass Revision Handling
-
-- `uniclass.revision`: Fallback revision tag (string) in YAML.
-- `uniclass.autodetect_revision` (default true): Parses revision from filenames (e.g., `..._v1_24.xlsx`) and overrides the YAML value.
-- `uniclass.enforce_monotonic_revision` (default true): Prevents loading if the incoming revision is not greater than the latest stored.
-- History: Each load writes snapshots to `uniclass_item_revision (code, revision, ...)` while `uniclass_item` holds the latest per code.
-
-### Matching, Anchors, Rerank
-
-- Facet rules: control eligibility with `matching.rules`, and disable facets with `matching.skip_tables`.
-- Feature boosts: `_feature_multiplier` favors relevant IFCs (type bias, predefined type, pset count, group/system, etc.).
-- Anchors from Uniclass: XLSX loader extracts IFC IDs from any “IFC …” columns into `ifc_mappings`; candidate scoring adds `matching.anchor_bonus` (optionally including ancestors) to those pairs.
-- Rerank with Ollama: `rerank.top_n`, `rerank.model`, `rerank.temperature`, `rerank.max_tokens`, `rerank.fewshot_per_facet`.
-  - Use a concise instruct model (e.g., `llama3.2:latest`, `llama3.1:8b-instruct`, `dolphin3:latest`).
-  - Few-shot examples are drawn from `ifc_mappings` for the same facet (if present).
-
-## Dependencies
-
-- Python: `pandas`, `psycopg[binary]`, `rapidfuzz`, `pyyaml`, `openpyxl`, `requests` (for `--embed`)
-- Postgres: 14+ with `pgcrypto` and `pgvector` (extension `vector` must be installed on the server). The schema creates both extensions if available.
-- Optional (embeddings): [Ollama](https://ollama.com) with a local embedding model. Recommended: `mxbai-embed-large` (1024 dims).
-- Optional (rerank): Ollama with a local instruct model (e.g., `llama3.2:latest`).
-
-## Outputs
-
-- `output/candidates.csv`: Candidate list with blended or reranked scores.
-- `output/viewer_mapping.json`: Edges grouped by IFC class for a viewer.
-
-## CLI Reference
-
-- `--load`                Load IFC + Uniclass into DB (upsert)
-- `--embed`               Generate and store embeddings via AI backend
-- `--openai`              Use OpenAI for embedding, classification, and reranking (default is Ollama)
-- `--candidates`          Generate candidate mappings and auto-accept above threshold
-- `--export`              Export accepted mappings to `viewer_mapping.json`
-- `--classify-disciplines` Classify IFC + Uniclass into labels (disciplines/subjects) via LLM; writes `output/taxonomy_cache.json`
-- `--reset-mappings`      Delete existing mappings for current Uniclass revision (see below)
-- `--reset-facets PR,SS`  Limit reset to listed Uniclass facets
-
-Classification flags:
-
-- `--classify-scope both|ifc|uniclass`  Limit which side to classify
-- `--classify-facets PR,SS`             Limit Uniclass facets to classify
-- `--classify-limit N`                  Stop after N items (0 = no limit)
-- `--classify-model name`               Override Ollama model for classification
-- `--classify-timeout SECONDS`          Per-call timeout (falls back to `rerank.timeout_s`)
-- `--classify-warmup-timeout SECONDS`   Warmup timeout for initial model load
-- `--classify-sleep SECONDS`            Sleep between requests for rate limiting
-
-Reset examples:
-
-- Reset all facets for current revision: `--reset-mappings`
-- Reset only PR/SS: `--reset-mappings --reset-facets PR,SS`
-
-## Getting Started
-
-PowerShell quickstart (Windows):
+Common command snippets (PowerShell on Windows shown; swap to `python`/`pip` on other platforms):
 
 ```powershell
-# 1) Create and activate venv with latest python
+# Environment prep
 py -3 -m venv .venv
 . .\.venv\Scripts\Activate.ps1
 pip install pandas psycopg[binary] rapidfuzz pyyaml openpyxl requests
 
-# 2) Copy config and adjust paths if needed
-cp config/settings.example.yaml config/settings.yaml
-
-# 3) Database connection (or put the same value in .env)
-$env:DATABASE_URL = "postgresql://postgres:***@host.docker.internal:5432/iob_ifc-uniclass"
-
-# 4) Apply schema (requires pgvector installed on the server)
+# Database schema
 psql "$env:DATABASE_URL" -f sql/schema.sql
 
-# 5) Optional: start Ollama for embeddings and rerank (once)
-# docker run -d --name ollama -p 11434:11434 ollama/ollama
-# ollama pull mxbai-embed-large
-# ollama pull llama3.2:latest   # for rerank (or another small instruct model)
-
-# 6) Load source data into Postgres
+# Core workflow
 py etl/etl_map.py --config config/settings.yaml --load
-
-# 7) Generate embeddings (re-run if model/text changes)
 py etl/etl_map.py --config config/settings.yaml --embed
-
-# 8) (Optional) Reset previous mappings for current revision
-py etl/etl_map.py --config config/settings.yaml --reset-mappings
-py etl/etl_map.py --config config/settings.yaml --reset-facets PR,SS
-py etl/etl_map.py --config config/settings.yaml --reset-mappings --reset-facets PR,SS
-
-# 9) Generate candidates (blended or with rerank if rerank.top_n > 0)
+py etl/etl_map.py --config config/settings.yaml --classify-disciplines --classify-scope both
 py etl/etl_map.py --config config/settings.yaml --candidates
-
-# 10) Export viewer JSON
 py etl/etl_map.py --config config/settings.yaml --export
 ```
 
-Tips:
+Reset helpers:
 
-- Revision: Filenames like `..._v1_24.xlsx` auto-detect Uniclass revision; monotonic enforcement stops downgrades. Override in `config/settings.yaml`.
-- Embeddings: If you change model or embedded text format, clear old rows and re-embed:
-  - `DELETE FROM text_embedding WHERE entity_type IN ('ifc','uniclass');`
-  - Ensure `embedding.expected_dim` matches your model (e.g., 1024 for `mxbai-embed-large`).
+```powershell
+py etl/etl_map.py --config config/settings.yaml --reset-mappings
+py etl/etl_map.py --config config/settings.yaml --reset-mappings --reset-facets PR,SS
+```
 
-### AI Backends: Ollama and OpenAI
+## Automated evaluation
 
-- Default backend is Ollama. Add `--openai` to use OpenAI.
-- Model selection per backend (configure in `config/settings.yaml`):
-  - Embeddings: `embedding.model` (Ollama) vs `embedding.openai_model` (OpenAI).
-    - If using OpenAI embeddings, set `embedding.openai_expected_dim` to the correct vector size (e.g., 1536 for `text-embedding-3-small`).
-  - Rerank/Classification: `rerank.model` (Ollama) vs `rerank.openai_model` (OpenAI).
-- Environment for OpenAI:
-  - `.env` must include `OPENAI_API_KEY=sk-...`
-  - Optional: `OPENAI_BASE_URL` (for Azure/proxy).
-  - Optional overrides: `OPENAI_EMBED_MODEL`, `OPENAI_EMBED_EXPECTED_DIM`, `OPENAI_RERANK_MODEL`.
+Use the recorded run id from candidate generation to score a run and compare against a baseline.
 
-Quick OpenAI usage
+```powershell
+python scripts/evaluate.py --config config/settings.yaml --run-id <RUN_UUID> --baseline-run-id <BASELINE_UUID> --fail-on-regression
+```
 
-- Install SDK in your venv: `pip install openai`
-- Set models in config: `embedding.openai_model: text-embedding-3-small`, `rerank.openai_model: gpt-4o-mini`.
-- Run: `py etl/etl_map.py --config config/settings.yaml --classify-disciplines --openai`
+Adjust thresholds via the `evaluation` block when you want the CLI to fail builds on regressions.
 
-Live taxonomy cache
+Set `--openai`, `--classify-facets`, `--classify-limit`, or `--classify-model` to override defaults for targeted runs.
 
-- Classification live-writes to `output/taxonomy_cache.json` periodically and on completion.
-- Re-run classification to resume; cached entries are skipped. Delete the file to force a full refresh.
+## Improving IFC to Uniclass matching accuracy
 
-## Current State Summary
+1. **Structured feature alignment**  
+   Parse IFC property sets, type enumerations (`PredefinedType`), and element assemblies into a feature table (e.g., `ifc_feature` with key/value pairs). Map Uniclass attribute tokens (from "Attributes" worksheet columns) into the same canonical vocabulary and introduce feature overlap scores. Matching models benefit from explicit signals like duct shape, flow medium, or system role beyond free text.
+2. **Facet-specific scoring models**  
+   Persist training snapshots of accepted mappings and fit lightweight classifiers (logistic regression or gradient-boosted trees) per facet that consume lexical similarity, embedding cosine, discipline overlap, feature overlap, anchor presence, and hierarchy distance. Replace the current linear blend with learned weights tuned to each facet noise profile.
+3. **Graph-propagated anchors**  
+   Use IFC inheritance and relationship graphs (`IfcRelAssignsToGroup`, `IfcRelAggregates`, `IfcRelPorts`) to propagate high-confidence anchors along structural edges. Penalise candidate pairs that violate graph constraints (e.g., subsystem relationships) or contradict known parent-child matches. This reduces drift when two Uniclass codes share similar names but belong to different systems.
+4. **Token canonicalisation pipeline**  
+   Maintain a `normalized_term` table containing lemmatized, domain-expanded tokens (unit conversions, regional spellings). Feed it into both lexical matching and embedding text generation to ensure consistent vocabulary before scoring. This also enables deterministic matching passes for highly structured tokens such as `Pr_23_75` or `IfcChillerType`.
+5. **Incremental evaluation harness**  
+   Record precision/recall metrics by facet after each ETL run, using reviewer decisions to generate gold labels. Automate regression detection so configuration tweaks can be measured before full-scale reruns.
 
-- Performance: Tight loops optimized (dictionary lookups instead of per-iteration DataFrame `.loc`); cosine-based pgvector ranking aligned between ORDER BY and score.
-- Scoring: Blended lexical + embedding with feature multipliers; Uniclass anchors from XLSX boost known pairs; confidence clamped to [0,1] to satisfy DB constraints.
-- Embeddings: Enriched texts on both sides; supports `mxbai-embed-large` via `embedding.expected_dim`. Note: LLM classification affects matching (gating/penalties), not the embedding text. Re-embed only if you change the embedding model or decide to include labels into the embedded text (not enabled by default).
-- Rerank: Optional Ollama instruct-model re-rank with few-shot examples from anchors; controlled by `rerank.*` in config.
-- Maintenance: `--reset-mappings` and `--reset-facets` flags to safely clear mapping rows by revision/facet before regeneration.
+Combining the structured features with facet-specific models provides a path toward more precise, explainable matches while keeping the pipeline efficient inside Postgres.
+
+## Tips and troubleshooting
+
+- Run `ensure_vector_indexes()` (automatic inside the CLI) after creating new embeddings so pgvector uses ANN search with the configured IVF parameters.
+- Always bump the Uniclass revision in the database when ingesting fresh spreadsheets; monotonic enforcement prevents accidental downgrades.
+- If embeddings fail due to dimension mismatch, update `embedding.expected_dim` (Ollama) or `embedding.openai_expected_dim` (OpenAI) and re-run `--embed` after clearing `text_embedding` for the affected entity types.
+- Set `PYTHONWARNINGS=ignore` or adjust logging within the script if repeated retries clutter the console during long runs.
+- See `agents.md` for a breakdown of the AI-driven components and hand-off points inside the pipeline.
