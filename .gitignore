@@ -3,6 +3,8 @@ Samples/
 output/
 config/settings.yaml
 end of the day.md
+scripts/
+
 
 ### Python bytecode / caches
 __pycache__/

@@ -38,6 +38,8 @@ A reproducible pipeline for aligning IFC 4x3 entities with Uniclass 2015 classif
    Produces ranked IFC to Uniclass suggestions, blending lexical scores, embedding distances, feature boosts, anchors, and label gating. Rows above `matching.auto_accept_threshold` are written to `ifc_uniclass_map`.
    - Set `matching.direction` to `uniclass_to_ifc` to ensure coverage from the Uniclass side.
    - Use `--reset-mappings` (optionally `--reset-facets PR,SS`) before re-generating to avoid stale rows from older revisions.
+   - New: pass `--candidates-debug` to print verbose progress and timing details for embedding neighbor queries and gating decisions (useful when pgvector or Ollama/OpenAI are flaky).
+   - New: pass `--candidates-stream-every N` to append candidates to `output/candidates.csv` every N rows while generating. This reduces memory and gives you on-disk progress during long runs. If not set or `0`, the CSV is written once at the end as before.
 6. **Optional LLM re-rank**  
    Enable by setting `rerank.top_n > 0` in the config; the CLI will automatically call the reranker during candidate generation to refine ordering inside the top-N shortlist per item.
 7. **Export viewer payload**  
@@ -68,6 +70,10 @@ A reproducible pipeline for aligning IFC 4x3 entities with Uniclass 2015 classif
   - Discipline gating: `discipline_filter`, `discipline_penalty`, and `discipline_source`.
 - **Embedding backend**: Select Ollama or OpenAI models, vector dimensions, batch sizes, and ANN index parameters (`embedding.ivf_lists`, `embedding.ivf_probes`, `embedding.query_timeout_ms`).
 - **Rerank backend**: Configure `rerank.model`, `rerank.top_n`, `fewshot_per_facet`, and timeouts; override with OpenAI equivalents when needed.
+ - **Candidate generation debug/streaming (CLI)**:
+   - `--candidates-debug` enables verbose logs: missing-embedding notes, neighbor timing (ms), and periodic progress (every ~50 items).
+   - `--candidates-stream-every N` writes batches to `output/candidates.csv` as they are produced. Headers are written once; batches append.
+   - Use together for long runs: `py etl/etl_map.py --config config/settings.yaml --candidates --candidates-debug --candidates-stream-every 1000`.
 - **Output**: `output.dir` and `output.viewer_json`.
 
 ## Running the CLI
@@ -88,6 +94,8 @@ py etl/etl_map.py --config config/settings.yaml --load
 py etl/etl_map.py --config config/settings.yaml --embed
 py etl/etl_map.py --config config/settings.yaml --classify-disciplines --classify-scope both
 py etl/etl_map.py --config config/settings.yaml --candidates
+py etl/etl_map.py --config config/settings.yaml --candidates --candidates-debug
+py etl/etl_map.py --config config/settings.yaml --candidates --candidates-debug --candidates-stream-every 1000
 py etl/etl_map.py --config config/settings.yaml --export
 ```
 
@@ -128,6 +136,7 @@ Combining the structured features with facet-specific models provides a path tow
 ## Tips and troubleshooting
 
 - Run `ensure_vector_indexes()` (automatic inside the CLI) after creating new embeddings so pgvector uses ANN search with the configured IVF parameters.
+ - Neighbor search resiliency: the pipeline applies per-statement timeouts and catches pgvector errors during candidate generation. On failure, it falls back to lexical-only scoring for the affected item and continues (with logs when `--candidates-debug` is enabled).
 - Always bump the Uniclass revision in the database when ingesting fresh spreadsheets; monotonic enforcement prevents accidental downgrades.
 - If embeddings fail due to dimension mismatch, update `embedding.expected_dim` (Ollama) or `embedding.openai_expected_dim` (OpenAI) and re-run `--embed` after clearing `text_embedding` for the affected entity types.
 - Set `PYTHONWARNINGS=ignore` or adjust logging within the script if repeated retries clutter the console during long runs.

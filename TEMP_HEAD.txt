@@ -1,0 +1,50 @@
+import argparse
+import json
+import os
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from uuid import UUID, uuid4
+
+import pandas as pd
+import psycopg
+from psycopg.rows import dict_row
+from rapidfuzz import fuzz
+import yaml
+import re
+
+
+@dataclass
+class Settings:
+    db_url: str
+    ifc_json: Path
+    ifc_schema_version: str
+    # Whether to expand IFC text with parent-chain context
+    ifc_use_parent_context: bool
+    uniclass_revision: str
+    autodetect_uniclass_revision: bool
+    enforce_monotonic_revision: bool
+    uniclass_csvs: Dict[str, Path]
+    uniclass_xlsx_dir: Optional[Path]
+    output_dir: Path
+    viewer_json: Path
+    top_k: int
+    auto_accept: float
+    review_threshold: float
+    synonyms: List[List[str]]
+    # Matching direction: 'ifc_to_uniclass' (default) or 'uniclass_to_ifc'
+    match_direction: str
+    # Optional facet-aware rules
+    matching_rules: Dict[str, dict]
+    # Optional convenience list of facets to skip entirely
+    skip_tables: List[str]
+    # Optional scoring boosts driven by IFC features
+    feature_boosts: Dict[str, float]
+    features_enabled: bool
+    feature_attribute_tokens: List[str]
+    evaluation_baseline_run_id: Optional[str]
+    evaluation_max_precision_drop: float
+    evaluation_min_recall: float
+    evaluation_fail_on_regression: bool
+    evaluation_accept_threshold: float

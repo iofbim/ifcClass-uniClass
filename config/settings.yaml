@@ -96,12 +96,12 @@ embedding:
   query_timeout_ms: 5000
 
 rerank:
-  top_n: 5
+  top_n: 0
   model: mistral:7b-instruct
   # OpenAI-specific chat model when using --openai (e.g., gpt-4o-mini)
   openai_model: gpt-4o-mini
   endpoint: http://localhost:11434
-  temperature: 0.2
+  temperature: 0.3
   max_tokens: 512
   fewshot_per_facet: 3
   timeout_s: 210

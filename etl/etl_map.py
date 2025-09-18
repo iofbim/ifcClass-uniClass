@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from uuid import UUID, uuid4
+import time
 
 import pandas as pd
 import psycopg
@@ -1848,6 +1849,7 @@ def _embedding_neighbors(
     limit: int,
     facets: Optional[List[str]] = None,
     timeout_ms: Optional[int] = None,
+    debug: bool = False,
 ) -> Dict[str, float]:
     """Return mapping neighbor_id -> cosine similarity in [0,1] using pgvector.
 
@@ -1872,17 +1874,32 @@ def _embedding_neighbors(
         )
         params = (qvec_text, target_entity_type, qvec_text, limit)
 
+    t0 = time.perf_counter()
+    rows = []
     with conn.cursor() as cur:
         # Optional safety timeout
         try:
             if timeout_ms is None:
                 timeout_ms = int(os.getenv('EMBED_QUERY_TIMEOUT_MS', '5000'))
             if timeout_ms and timeout_ms > 0:
-                cur.execute("SET LOCAL statement_timeout = %s", (int(timeout_ms),))
+                cur.execute(f"SET LOCAL statement_timeout = {int(timeout_ms)}")
+        except Exception as e:
+            if debug:
+                print(f"[_embedding_neighbors] failed to set statement_timeout: {e}")
+        try:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        except Exception as e:
+            if debug:
+                print(f"[_embedding_neighbors] query failed for entity_type={target_entity_type}, limit={limit}, facets={facets}: {e}")
+            # On failure, return empty result so outer code falls back to lexical-only
+            rows = []
+    t1 = time.perf_counter()
+    if debug:
+        try:
+            print(f"[_embedding_neighbors] fetched {len(rows)} neighbors for {target_entity_type} in {1000*(t1-t0):.1f} ms")
         except Exception:
             pass
-        cur.execute(sql, params)
-        rows = cur.fetchall()
     out: Dict[str, float] = {}
     for r in rows:
         code = r[0] if not isinstance(r, dict) else r["entity_id"]
@@ -1923,10 +1940,23 @@ def generate_candidates_blended(
     anchor_bonus: float,
     anchor_use_ancestors: bool,
     rules: Optional[Dict[str, dict]] = None,
+    debug: bool = False,
+    stream_to_csv: Optional[Path] = None,
+    stream_every: int = 0,
 ) -> pd.DataFrame:
     # Precompute lex features on uc_df
     uc_work = uc_df.copy()
     uc_work["norm_title"] = uc_work["title"].fillna("").map(normalize_text).map(lambda s: expand_with_synonyms(s, synonyms))
+    # Streaming setup
+    header_cols = [
+        "ifc_id", "code", "facet", "uniclass_title", "score",
+        "lexical_score", "embedding_score", "feature_multiplier",
+        "discipline_multiplier", "token_overlap_multiplier", "anchor_applied",
+    ]
+    header_written = False
+    buffered_rows: List[dict] = []
+    processed_uc = 0
+    total_uc = int(len(uc_work))
     # Infer lightweight disciplines for Uniclass items
     def _infer_uc_disciplines(title: str) -> List[str]:
         t = (title or "").lower()
@@ -2028,13 +2058,15 @@ def generate_candidates_blended(
             # Set ivfflat probes for better recall and ensure indexes
             with conn.cursor() as _c:
                 try:
-                    _c.execute("SET LOCAL ivfflat.probes = %s", (int(os.getenv('EMBED_IVF_PROBES', '10')),))
+                    _c.execute(f"SET LOCAL ivfflat.probes = {int(os.getenv('EMBED_IVF_PROBES', '10'))}")
                 except Exception:
                     pass
-            emb_scores = _embedding_neighbors(conn, 'uniclass', qvec_text, embedding_top_k, facets=facets, timeout_ms=int(os.getenv('EMBED_QUERY_TIMEOUT_MS', '5000')))
+            emb_scores = _embedding_neighbors(conn, 'uniclass', qvec_text, embedding_top_k, facets=facets, timeout_ms=int(os.getenv('EMBED_QUERY_TIMEOUT_MS', '5000')), debug=debug)
             # Optionally filter by facets
             if facets:
                 emb_scores = {c: s for c, s in emb_scores.items() if uc_info.get(c, ("", "", ""))[0] in facets}
+        elif debug:
+            print(f"[candidates] missing IFC embedding for {ifc_id}; using lexical only")
 
         # If we have embedding neighbors, restrict lexical scoring to those neighbors only.
         # This avoids O(|pool|) lexical comparisons for every IFC class.
@@ -2127,7 +2159,7 @@ def generate_candidates_blended(
 
         scored.sort(key=lambda x: x[3], reverse=True)
         for code, facet, title, s, lex_raw, emb_raw, base_mult, disc_mult, anchor_hit in scored[:top_k]:
-            rows.append({
+            rec = {
                 "ifc_id": ifc_id,
                 "code": code,
                 "facet": facet,
@@ -2139,7 +2171,44 @@ def generate_candidates_blended(
                 "discipline_multiplier": round(disc_mult, 4),
                 "token_overlap_multiplier": 1.0,
                 "anchor_applied": bool(anchor_hit),
-            })
+            }
+            rows.append(rec)
+            if stream_to_csv is not None:
+                buffered_rows.append(rec)
+                if stream_every and len(buffered_rows) >= int(stream_every):
+                    # Flush batch to CSV
+                    try:
+                        stream_to_csv.parent.mkdir(parents=True, exist_ok=True)
+                        dfb = pd.DataFrame(buffered_rows)
+                        for col in header_cols:
+                            if col not in dfb.columns:
+                                dfb[col] = None
+                        dfb = dfb[header_cols]
+                        dfb.to_csv(stream_to_csv, mode=('a' if header_written else 'w'), index=False, header=(not header_written))
+                        header_written = True
+                        buffered_rows.clear()
+                    except Exception as e:
+                        if debug:
+                            print(f"[candidates-stream] failed to write batch: {e}")
+        processed_uc += 1
+        if debug and (processed_uc % 50 == 0 or processed_uc == total_uc):
+            print(f"[candidates] processed {processed_uc}/{total_uc} Uniclass items")
+
+    # Final flush for any remaining buffered rows
+    if stream_to_csv is not None and buffered_rows:
+        try:
+            stream_to_csv.parent.mkdir(parents=True, exist_ok=True)
+            dfb = pd.DataFrame(buffered_rows)
+            for col in header_cols:
+                if col not in dfb.columns:
+                    dfb[col] = None
+            dfb = dfb[header_cols]
+            dfb.to_csv(stream_to_csv, mode=('a' if header_written else 'w'), index=False, header=(not header_written))
+            header_written = True
+            buffered_rows.clear()
+        except Exception as e:
+            if debug:
+                print(f"[candidates-stream] failed to write final batch: {e}")
     return pd.DataFrame(rows)
 
 
@@ -2154,6 +2223,9 @@ def generate_candidates_uc2ifc_blended(
     anchor_bonus: float,
     anchor_use_ancestors: bool,
     rules: Optional[Dict[str, dict]] = None,
+    debug: bool = False,
+    stream_to_csv: Optional[Path] = None,
+    stream_every: int = 0,
 ) -> pd.DataFrame:
     # Prepare IFC searchable text (prefer augmented parent-chain text if present)
     ifc_work = ifc_df.copy()
@@ -2198,6 +2270,16 @@ def generate_candidates_uc2ifc_blended(
                 if labs:
                     uc_llm_map[_code] = list(dict.fromkeys(labs))
 
+    # Streaming setup for incremental CSV writes
+    header_cols = [
+        "ifc_id", "code", "facet", "uniclass_title", "score",
+        "lexical_score", "embedding_score", "feature_multiplier",
+        "discipline_multiplier", "token_overlap_multiplier", "anchor_applied",
+    ]
+    header_written = False
+    buffered_rows: List[dict] = []
+    processed_uc = 0
+    total_uc = int(len(uc_df))
     rows = []
     # Discipline options
     def _disc_opts(rules: Optional[Dict[str, dict]]):
@@ -2222,13 +2304,15 @@ def generate_candidates_uc2ifc_blended(
         # Embedding neighbors from Uniclass -> IFC
         emb_scores: Dict[str, float] = {}
         qvec_text = _fetch_embedding(conn, "uniclass", code)
+        if not qvec_text and debug:
+            print(f"[candidates] missing embedding for Uniclass code {code}; using lexical only")
         if qvec_text:
             with conn.cursor() as _c:
                 try:
-                    _c.execute("SET LOCAL ivfflat.probes = %s", (int(os.getenv('EMBED_IVF_PROBES', '10')),))
+                    _c.execute(f"SET LOCAL ivfflat.probes = {int(os.getenv('EMBED_IVF_PROBES', '10'))}")
                 except Exception:
                     pass
-            emb_scores = _embedding_neighbors(conn, 'ifc', qvec_text, embedding_top_k)
+            emb_scores = _embedding_neighbors(conn, 'ifc', qvec_text, embedding_top_k, facets=None, timeout_ms=int(os.getenv('EMBED_QUERY_TIMEOUT_MS', '5000')), debug=debug)
 
         # Lexical: restrict to embedding neighbors if present, else full IFC set
         restrict_ids = set(emb_scores.keys()) if emb_scores else None
@@ -2356,7 +2440,7 @@ def generate_candidates_uc2ifc_blended(
 
         scored.sort(key=lambda x: x[5], reverse=True)
         for code, facet, title, ifc_id, _lbl, s, lex_raw, emb_raw, base_mult, disc_mult, token_mult, anchor_hit in scored[:top_k]:
-            rows.append({
+            rec = {
                 "ifc_id": ifc_id,
                 "code": code,
                 "facet": facet,
@@ -2368,7 +2452,42 @@ def generate_candidates_uc2ifc_blended(
                 "discipline_multiplier": round(disc_mult, 4),
                 "token_overlap_multiplier": round(token_mult, 4),
                 "anchor_applied": bool(anchor_hit),
-            })
+            }
+            rows.append(rec)
+            if stream_to_csv is not None:
+                buffered_rows.append(rec)
+                if stream_every and len(buffered_rows) >= int(stream_every):
+                    try:
+                        stream_to_csv.parent.mkdir(parents=True, exist_ok=True)
+                        dfb = pd.DataFrame(buffered_rows)
+                        for col in header_cols:
+                            if col not in dfb.columns:
+                                dfb[col] = None
+                        dfb = dfb[header_cols]
+                        dfb.to_csv(stream_to_csv, mode=('a' if header_written else 'w'), index=False, header=(not header_written))
+                        header_written = True
+                        buffered_rows.clear()
+                    except Exception as e:
+                        if debug:
+                            print(f"[candidates-stream] failed to write batch: {e}")
+        processed_uc += 1
+        if debug and (processed_uc % 50 == 0 or processed_uc == total_uc):
+            print(f"[candidates] processed {processed_uc}/{total_uc} Uniclass items")
+
+    if stream_to_csv is not None and buffered_rows:
+        try:
+            stream_to_csv.parent.mkdir(parents=True, exist_ok=True)
+            dfb = pd.DataFrame(buffered_rows)
+            for col in header_cols:
+                if col not in dfb.columns:
+                    dfb[col] = None
+            dfb = dfb[header_cols]
+            dfb.to_csv(stream_to_csv, mode=('a' if header_written else 'w'), index=False, header=(not header_written))
+            header_written = True
+            buffered_rows.clear()
+        except Exception as e:
+            if debug:
+                print(f"[candidates-stream] failed to write final batch: {e}")
     return pd.DataFrame(rows)
 
 
@@ -2581,6 +2700,8 @@ def main():
     ap.add_argument("--config", required=True, help="Path to YAML settings")
     ap.add_argument("--load", action="store_true", help="Load IFC and Uniclass into DB")
     ap.add_argument("--candidates", action="store_true", help="Generate top-k candidate links and auto-accept above threshold")
+    ap.add_argument("--candidates-debug", action="store_true", help="Verbose debug logging during candidate generation")
+    ap.add_argument("--candidates-stream-every", type=int, default=0, help="Append to candidates.csv every N rows (0 = write at end)")
     ap.add_argument("--export", action="store_true", help="Export viewer JSON from accepted mappings")
     # Optional maintenance flags
     ap.add_argument("--reset-mappings", action="store_true", help="Delete existing mappings for current Uniclass revision (optionally filter by --reset-facets)")
@@ -2820,8 +2941,8 @@ def main():
             # Set probes for this session for better recall/latency tradeoff
             try:
                 with conn.cursor() as cur:
-                    cur.execute("SET ivfflat.probes = %s", (int(s.embed_ivf_probes),))
-                    cur.execute("SET statement_timeout = %s", (int(s.embed_query_timeout_ms),))
+                    cur.execute(f"SET ivfflat.probes = {int(s.embed_ivf_probes)}")
+                    cur.execute(f"SET statement_timeout = {int(s.embed_query_timeout_ms)}")
             except Exception:
                 pass
             use_embed = s.embedding_weight and float(s.embedding_weight) > 0
@@ -2830,11 +2951,24 @@ def main():
                 print("[info] ifc_to_uniclass is disabled; forcing direction=uniclass_to_ifc")
                 direction = 'uniclass_to_ifc'
             print(f"[candidates] run id: {run_id} (direction={direction})")
+            # Configure streaming and debug flags
+            cands_path = s.output_dir / "candidates.csv"
+            stream_every = int(getattr(args, "candidates_stream_every", 0) or 0)
+            stream_path = cands_path if stream_every > 0 else None
+            cand_debug = bool(getattr(args, "candidates_debug", False) or getattr(args, "debug", False))
             if use_embed:
-                cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
+                cands = generate_candidates_uc2ifc_blended(
+                    conn, ifc_df, uc_df, s.synonyms, s.top_k, s.embedding_weight, s.embedding_top_k,
+                    s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules,
+                    debug=cand_debug, stream_to_csv=stream_path, stream_every=stream_every,
+                )
             else:
                 # Lexical-only reverse direction using the same blended helper with alpha=0 via parameters
-                cands = generate_candidates_uc2ifc_blended(conn, ifc_df, uc_df, s.synonyms, s.top_k, 0.0, s.embedding_top_k, s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules)
+                cands = generate_candidates_uc2ifc_blended(
+                    conn, ifc_df, uc_df, s.synonyms, s.top_k, 0.0, s.embedding_top_k,
+                    s.anchor_bonus, s.anchor_use_ancestors, s.matching_rules,
+                    debug=cand_debug, stream_to_csv=stream_path, stream_every=stream_every,
+                )
 
             # Optional LLM rerank
             if int(s.rerank_top_n or 0) > 0:
@@ -2873,8 +3007,9 @@ def main():
                 if col not in cands.columns:
                     cands[col] = None
             log_candidate_history(conn, cands, run_id, s.ifc_schema_version, s.uniclass_revision, direction)
-            cands_path = s.output_dir / "candidates.csv"
-            cands.to_csv(cands_path, index=False)
+            # If streaming is disabled, write once at the end
+            if not stream_path:
+                cands.to_csv(cands_path, index=False)
             write_candidate_edges(conn, cands, s.ifc_schema_version, s.uniclass_revision, s.auto_accept)
         if args.export:
             export_viewer_json(conn, s.viewer_json)
