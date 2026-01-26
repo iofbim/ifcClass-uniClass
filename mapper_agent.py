@@ -1,9 +1,11 @@
 import os
 import json
 import asyncio
+import math
 import pandas as pd
 from pathlib import Path
 from typing import List, Dict, Optional
+from collections import Counter
 # You may need to install: openai pandas openpyxl
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm
@@ -19,103 +21,184 @@ OUTPUT_DIR = Path("output")
 
 # Prompt for the Semantic Agent
 SYSTEM_PROMPT = """
-You are an expert in BIM Interoperability, specifically matching Uniclass 2015 tables to the IFC 4.3 Schema.
-Your goal is to find the most specific and logically correct IFC entity for a given Uniclass item.
+You are a BIM Specialist matching Uniclass 2015 to IFC 4.3. 
+Follow these NBS Mapping Scenarios:
+1. Scenario 1: Direct match to an IfcEntity.
+2. Scenario 2 (Specificity): Prefer a PredefinedType (e.g., IfcWall / PARAPET) over a generic Entity if it fits perfectly.
+3. Scenario 3 (One-to-Part): Match sub-components to the Entity that best hosts that function.
+4. Scenario 4 (Context): Use the Uniclass Group/Section to distinguish between 'Structural' or 'Service' items.
 
-**Rules (Based on NBS Mapping Scenarios):**
-1. **Scenario 2 (Specificity):** If a specific PredefinedType exists that perfectly matches the Uniclass item (e.g., Uniclass 'Shingles' -> IFC 'IfcCovering.ROOFING'), you MUST choose it over the generic Class ('IfcCovering').
-2. **Scenario 1 (One-to-Many):** If the Uniclass item covers multiple distinct IFC concepts, list the top 2-3 matches.
-3. **Scenario 3 (Ambiguity):** If the item is multi-functional (e.g., 'Tap and Hand Dryer'), choose the primary function but note the ambiguity.
-4. **Scenario 6/7 (Fallbacks):** If no specific PredefinedType fits, falling back to the generic Class (e.g., 'IfcMember') is the correct behavior.
-
-**Output Format:**
-Return valid JSON only:
-{
-    "matches": [
-        {
-            "ifc_target": "IfcCovering.ROOFING", 
-            "confidence": 0.95, 
-            "rationale": "Uniclass item explicitly mentions roofing shingles, which aligns with IfcCovering.ROOFING."
-        }
-    ],
-    "nbs_scenario": "2",
-    "notes": "Optional observations"
-}
+MANDATORY WORKFLOW:
+1. Identify the core IfcEntity.
+2. Check if a 'Valid Type' provided for that entity is more specific than the base Entity.
+3. NEVER use 'USERDEFINED' or 'NOTDEFINED'. If no specific type fits, return the Entity and set type to null.
 """
 
 class SemanticMapper:
     def __init__(self, client: AsyncOpenAI, model_name: str = "gpt-4o"):
         self.client = client
         self.model_name = model_name
+        self.ifc_data: Dict = {} # Raw IFC JSON data
         self.ifc_targets: List[Dict] = []
         self.uniclass_df: pd.DataFrame = pd.DataFrame()
+        self.processed_codes = set()
+        self.idf: Dict[str, float] = {} # Inverse Document Frequency map
+        self.inheritance: Dict[str, str] = {} # Child -> Parent
+        self.class_descriptions: Dict[str, str] = {} # Class -> Desc
+        self.user_ifc_limit: Optional[str] = None # User defined root
 
     def load_ifc_targets(self):
-        """Flattens IFC JSON into Classes and PredefinedTypes."""
+        """Flattens IFC JSON into Classes and PredefinedTypes and builds IDF index."""
         print(f"Loading IFC targets from {IFC_JSON_PATH}...")
         with open(IFC_JSON_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
         classes = data.get('classes', {})
+        self.ifc_data = classes
         
         self.ifc_targets = []
+        doc_counts = Counter()
+        self.inheritance = {}
+        self.class_descriptions = {}
+
+        # 1. First Pass: Build Hierarchy & Description Maps
         for name, det in classes.items():
-            desc = det.get('definition') or det.get('description') or ''
+            self.inheritance[name] = det.get('parent')
+            self.class_descriptions[name] = det.get('definition') or det.get('description') or ''
+
+        # 2. Second Pass: Build Targets with Rich Context
+        for name, det in classes.items():
+            desc = self.class_descriptions[name]
+            parent = self.inheritance.get(name)
+            parent_desc = self.class_descriptions.get(parent, "") if parent else ""
+            
+            # Enrich text with Parent context (Contextual Search)
+            # "IfcWall: Construction element... [Context: IfcBuildingElement: Major functional part...]"
+            full_text = f"{name}: {desc}"
+            if parent and parent_desc:
+                full_text += f" [Parent {parent}: {parent_desc}]"
+
             # 1. Class
             self.ifc_targets.append({
                 "target": name, 
                 "type": "Class",
-                "text": f"{name}: {desc}"
+                "text": full_text
             })
+            
             # 2. PredefinedTypes
             predef = det.get('predefinedType')
             if predef and isinstance(predef, dict):
                 for val in predef.get('values', []):
                     if val not in ["USERDEFINED", "NOTDEFINED"]:
                         t = f"{name}.{val}"
+                        # For types, the specific desc is usually not in JSON, relying on Class + Parent
+                        text_sub = f"{t}: Specific type '{val}' of {name}. {desc}"
+                        if parent_desc:
+                            text_sub += f" [Parent Context: {parent_desc}]"
+
                         self.ifc_targets.append({
                             "target": t,
                             "type": "PredefinedType",
-                            "text": f"{t}: Specific type '{val}' of {name}. {desc}"
+                            "text": text_sub
                         })
-        print(f"Loaded {len(self.ifc_targets)} IFC mapping targets.")
         
+        # Build IDF Index
+        print("Building statistical index (IDF) for lexical search...")
+        total_docs = len(self.ifc_targets)
+        for item in self.ifc_targets:
+            # Tokenize the full description text
+            tokens = self._tokenize_text(item['text'])
+            # We count passing a token once per document (set linkage)
+            for t in tokens:
+                doc_counts[t] += 1
+                
+        # Calculate IDF: log(N / df)
+        for token, count in doc_counts.items():
+            self.idf[token] = math.log(total_docs / (count + 1))
+            
+        print(f"Loaded {len(self.ifc_targets)} IFC targets and indexed {len(self.idf)} unique terms.")
+
+    def get_clean_structure(self, entity_name):
+        """Extracts entity info and filters out junk types."""
+        entity = self.ifc_data.get(entity_name)
+        if not entity: return None
+        
+        # Filter out junk types
+        raw_types = entity.get('predefinedType', {}).get('values', []) if entity.get('predefinedType') else []
+        clean_types = [t for t in raw_types if t not in ['USERDEFINED', 'NOTDEFINED']]
+        
+        return {
+            "definition": (entity.get('definition') or entity.get('description') or '')[:150], # Truncate for VRAM
+            "valid_types": clean_types
+        }
+
+    def get_ifc_subclasses(self, parent_name):
+        """Recursively find all subclasses of a given IFC entity."""
+        if not parent_name:
+            # Return a reasonable subset or all if no limit. 
+            # In the user's scenario, they might want all products by default if no limit is set.
+            # But let's follow the user's logic: if no limit, we might need a different approach 
+            # or just return everything that is a relevant match from lexical search.
+            # However, map_item uses this to build the context.
+            return list(self.ifc_data.keys())
+        
+        subclasses = []
+        for name in self.ifc_data.keys():
+            if self._inherits_from(name, parent_name):
+                subclasses.append(name)
+        return subclasses
+    def _inherits_from(self, child: str, ancestor: str) -> bool:
+        """Recursive check if child inherits from ancestor."""
+        # Clean up PredefinedType (IfcWall.SOLID -> IfcWall)
+        if "." in child:
+            child = child.split(".")[0]
+            
+        curr = child
+        # Safety depth limit
+        for _ in range(10):
+            if curr == ancestor:
+                return True
+            parent = self.inheritance.get(curr)
+            if not parent:
+                return False
+            curr = parent
+        return False
+
     def _is_relevant_target(self, ifc_target: str, table_code: str) -> bool:
         """
         Dynamically filters IFC targets based on the Uniclass table code.
         """
-        t = ifc_target.lower()
+        # 0. User Override (Top Priority)
+        if self.user_ifc_limit:
+             return self._inherits_from(ifc_target, self.user_ifc_limit)
+
         if not table_code:
             return True
             
         code_prefix = table_code[:2].lower() # "pr", "ac", "rk"
         
-        # 1. Products / Systems / Elements / Spaces -> Physical Objects
+        # 1. Products / Systems / Elements / Spaces -> Physical Objects (IfcProduct)
         if code_prefix in ["pr", "ss", "ef", "sl"]:
-            # Penalize Relationships and Abstracts
-            if t.startswith("ifcrel"): return False
-            if t.startswith("ifcprocess"): return False
-            if t.startswith("ifcactor"): return False
-            # Ideally checks inheritance from IfcProduct, but name heuristic works for now
-            return True
+            # STRICT FILTER: Must inherit from IfcProduct
+            if self._inherits_from(ifc_target, "IfcProduct"):
+                return True
+            # Allow SpatialStructure for SL/Zz tables if needed
+            if code_prefix == "sl" and self._inherits_from(ifc_target, "IfcSpatialElement"):
+                return True
+            return False
             
         # 2. Activities -> Processes
         if code_prefix == "ac":
-             if "process" in t or "task" in t or "procedure" in t: return True
-             # Allow some products as they might be inputs/outputs, but prefer process
-             if t.startswith("ifcrel"): return False
-             return True
+             return self._inherits_from(ifc_target, "IfcProcess")
 
         # 3. Roles / Resourcing -> Actors / Resources
         if code_prefix == "ro":
-            if "actor" in t or "role" in t or "person" in t or "organization" in t: return True
-            return False
+            return self._inherits_from(ifc_target, "IfcActor") or self._inherits_from(ifc_target, "IfcResource")
             
         # 4. Project Management / Work Packaging -> Controls / Groups
         if code_prefix == "pm":
-             if "control" in t or "group" in t: return True
-             return True
+             return self._inherits_from(ifc_target, "IfcControl") or self._inherits_from(ifc_target, "IfcGroup")
              
-        # Default: Allow everything for unknown tables (like Rk? Rk is arguably Relationship/Property)
+        # Default: Allow everything for unknown tables
         return True
 
     def _tokenize_text(self, text):
@@ -183,8 +266,10 @@ class SemanticMapper:
                 if header_idx != -1:
                     df = pd.read_excel(f, skiprows=header_idx)
                     df.columns = [str(c).title().strip() for c in df.columns]
+                    # Identify available columns to preserve context
+                    cols_to_keep = [c for c in ['Code', 'Title', 'Group', 'Sub Group'] if c in df.columns]
                     if 'Code' in df.columns and 'Title' in df.columns:
-                        df = df[['Code', 'Title']].dropna()
+                        df = df[cols_to_keep].dropna(subset=['Code', 'Title'])
                         frames.append(df)
 
             except Exception as e:
@@ -231,14 +316,18 @@ class SemanticMapper:
             t_text = f"{split_target} {t['text']}" 
             t_toks = self._tokenize_text(t_text)
             
-            # Intersection count
-            score = len(q_toks & t_toks)
+            # Intersection with IDF weighting
+            overlap = q_toks & t_toks
+            if not overlap:
+                score = 0
+            else:
+                score = sum(self.idf.get(token, 0) for token in overlap)
             
             # Boost if IFC class name or simple variations appear in query
             # e.g. query "Furniture" matches "IfcFurniture"
             target_lower = t['target'].lower()
             if any(qt in target_lower for qt in q_toks):
-                 score += 5
+                 score += 5.0 # Strong boost for direct name match
             
             scored.append((score, t))
         
@@ -268,19 +357,53 @@ class SemanticMapper:
         
 
 
-    async def map_one(self, code: str, title: str):
-        candidates = self._simple_retrieval(title, table_code=code)
+    async def map_item(self, row: pd.Series) -> Dict:
+        """Refined mapping logic with two-step reasoning and NBS scenarios."""
+        # 1. Get filtered IFC candidates based on inheritance and lexical relevance
+        # We limit the search to the user's ifcLimit if provided
+        candidates_raw = self._simple_retrieval(row['Title'], table_code=row['Code'], top_k=40)
+        candidates = [c['target'] for c in candidates_raw]
         
-        cand_list = [f"- {c['target']} ({c['type']})" for c in candidates]
-        cand_str = "\n".join(cand_list)
-        
-        user_msg = f"""
-        Uniclass Item: {code} - {title}
-        
-        Candidate IFC Targets:
-        {cand_str}
-        
-        Identify the best match(es).
+        # 2. Build a selection list of Entity + Clean Types
+        options_context = []
+        for ent in candidates:
+            base_ent = ent.split('.')[0]
+            struct = self.get_clean_structure(base_ent)
+            if struct:
+                type_info = f" [Valid Types: {', '.join(struct['valid_types'])}]" if struct['valid_types'] else ""
+                options_context.append(f"- {base_ent}: {struct['definition']}{type_info}")
+
+        options_context = list(dict.fromkeys(options_context))[:30]
+
+        # 3. Handle Refinement Context (Previous Guess)
+        refine_context = ""
+        if 'Previous_Guess' in row and pd.notna(row['Previous_Guess']):
+            score = row.get('User_Score', 'Unknown')
+            # Translate score to helpful hint
+            hint = ""
+            if str(score) == "2.0" or str(score) == "2":
+                hint = "The entity was correct, but a more specific PredefinedType from the list below is likely better."
+            elif str(score) == "1.0" or str(score) == "1":
+                hint = "A better child entity exists deeper in the hierarchy than this previous guess."
+            elif str(score) == "0.0" or str(score) == "0":
+                hint = "The previous guess was irrelevant. Try a completely different approach."
+            
+            refine_context = f"\nPREVIOUS GUESS: {row['Previous_Guess']} (User Score: {score})\nHINT: {hint}\n"
+
+        prompt = f"""
+        Uniclass Item: {row['Code']} - {row['Title']}
+        Context: {row.get('Group', '')} (Subgroup: {row.get('Sub Group', '')})
+        {refine_context}
+        Target IFC Options:
+        {chr(10).join(options_context)}
+
+        Return JSON:
+        {{
+            "ifc_entity": "IfcEntityName",
+            "predefined_type": "TYPE_NAME or null",
+            "nbs_scenario": "1, 2, 3, or 4",
+            "justification": "Brief explanation"
+        }}
         """
         
         try:
@@ -288,33 +411,33 @@ class SemanticMapper:
                 model=self.model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg}
+                    {"role": "user", "content": prompt}
                 ],
                 temperature=0.0,
                 response_format={"type": "json_object"}
             )
             content = resp.choices[0].message.content
-            # Debug: print raw content if needed
-            print(f"  [DEBUG] LLM Raw: {content[:100]}...")
             parsed = json.loads(content)
-            # print(f"  [DEBUG] Parsed Keys: {parsed.keys()}")
-            parsed['code'] = code
+            parsed['code'] = row['Code']
             return parsed
         except Exception as e:
-            print(f"   [ERROR] LLM/Parsing failed for {code}: {e}")
-            if 'content' in locals():
-                print(f"   [debug content]: {content}")
-            return {"code": code, "error": str(e)}
+            print(f"   [ERROR] LLM/Parsing failed for {row['Code']}: {e}")
+            return {"code": row['Code'], "error": str(e)}
 
     def load_progress(self):
         """Reads existing output CSV to identify already processed codes."""
         csv_path = OUTPUT_DIR / "mapping_report.csv"
-        if csv_path.exists():
+        if csv_path.exists() and csv_path.stat().st_size > 0:
             try:
-                # Read only Code column to be fast
-                df_done = pd.read_csv(csv_path, usecols=['Code'])
-                self.processed_codes = set(df_done['Code'].astype(str))
-                print(f"Found {len(self.processed_codes)} already mapped items in output using {csv_path.name}.")
+                # Read with flexible header handling
+                df_done = pd.read_csv(csv_path)
+                # Ensure we have a Code column regardless of spacing or case
+                df_done.columns = [c.strip().title() for c in df_done.columns]
+                if 'Code' in df_done.columns:
+                    self.processed_codes = set(df_done['Code'].astype(str))
+                    print(f"Found {len(self.processed_codes)} already mapped items in output using {csv_path.name}.")
+                else:
+                    print(f"Warning: 'Code' column not found in {csv_path.name}. Headers: {list(df_done.columns)}")
             except Exception as e:
                 print(f"Could not read existing progress: {e}")
                 self.processed_codes = set()
@@ -331,39 +454,54 @@ class SemanticMapper:
             print(f"Skipping {initial_count - new_count} existing items. Remaining: {new_count}.")
 
     def filter_for_refinement(self):
-        """Filters uniclass_df to only items that were scored 0 or 1 by user."""
+        """Filters uniclass_df to only items that were scored 0, 1 or 2 by user."""
         csv_path = OUTPUT_DIR / "mapping_report.csv"
-        if not csv_path.exists():
+        if not csv_path.exists() or csv_path.stat().st_size == 0:
             print("No output file found to refine.")
-            self.uniclass_df = self.uniclass_df.iloc[0:0] # Empty
+            self.uniclass_df = pd.DataFrame()
             return
 
         try:
             df = pd.read_csv(csv_path)
-            # Ensure Score column exists
+            df.columns = [c.strip().title() for c in df.columns]
+            
             if 'User_Score' not in df.columns:
                 print("No 'User_Score' column found in report.")
-                self.uniclass_df = self.uniclass_df.iloc[0:0]
+                self.uniclass_df = pd.DataFrame()
                 return
             
-            # Find low scores (0 or 1)
-            # Handle mixed types (int/str/float)
+            # Find low scores (0, 1, or 2)
             def is_low(x):
                 try:
-                    return float(x) in [0.0, 1.0]
+                    return float(x) in [0.0, 1.0, 2.0]
                 except:
                     return False
             
-            low_score_codes = df[df['User_Score'].apply(is_low)]['Code'].unique()
-            print(f"Found {len(low_score_codes)} items with low scores (0-1) to refine.")
+            # Sort by Date to get the latest entry for each code
+            if 'Date' in df.columns:
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.sort_values('Date')
             
-            initial_count = len(self.uniclass_df)
-            self.uniclass_df = self.uniclass_df[self.uniclass_df['Code'].isin(low_score_codes)]
-            print(f"Refining {len(self.uniclass_df)} items (Filtered from {initial_count}).")
+            latest_entries = df.groupby('Code').tail(1)
+            low_score_rows = latest_entries[latest_entries['User_Score'].apply(is_low)].copy()
+            
+            print(f"Found {len(low_score_rows)} items with low scores (0-2) to refine.")
+            
+            if not low_score_rows.empty:
+                # Prepare Previous_Guess
+                def make_prev(row):
+                    ent = row.get('Ifc_Entity') or row.get('Ifc_Target') or 'None'
+                    pt = row.get('Predefined_Type')
+                    return f"{ent}{'.' + str(pt) if pt and str(pt).lower() != 'null' else ''}"
+                
+                low_score_rows['Previous_Guess'] = low_score_rows.apply(make_prev, axis=1)
+                self.uniclass_df = low_score_rows
+            else:
+                self.uniclass_df = pd.DataFrame()
             
         except Exception as e:
             print(f"Error reading report for refinement: {e}")
-            self.uniclass_df = self.uniclass_df.iloc[0:0]
+            self.uniclass_df = pd.DataFrame()
 
     async def run_batch(self, limit=10):
         results = []
@@ -374,14 +512,19 @@ class SemanticMapper:
             print("No new items to process after filtering.")
             return []
 
-        pending = [self.map_one(row['Code'], row['Title']) for _, row in subset.iterrows()]
+        pending = [self.map_item(row) for _, row in subset.iterrows()]
         
         # Run concurrently
         completed_map = {}
-        for coro in tqdm(asyncio.as_completed(pending), total=len(pending), desc="Mapping"):
-            res = await coro
-            if 'code' in res:
-                completed_map[res['code']] = res
+        try:
+            for coro in tqdm(asyncio.as_completed(pending), total=len(pending), desc="Mapping"):
+                res = await coro
+                if 'code' in res:
+                    completed_map[res['code']] = res
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            print("\n\n[WARN] Processing interrupted! Saving results processed so far...")
+            # We catch this to allow the function to proceed to the 'Join' phase below
+            # unprocessed items will get the 'Processing failed' error.
             
         # Join with inputs
         from datetime import datetime
@@ -397,7 +540,11 @@ class SemanticMapper:
             
             if code in completed_map:
                 # Update with the LLM result data
-                rec.update(completed_map[code])
+                res_data = completed_map[code]
+                rec['ifc_entity'] = res_data.get('ifc_entity')
+                rec['predefined_type'] = res_data.get('predefined_type')
+                rec['nbs_scenario'] = res_data.get('nbs_scenario')
+                rec['justification'] = res_data.get('justification')
             else:
                  rec['error'] = "Processing failed or timed out"
             results.append(rec)
@@ -412,38 +559,28 @@ class SemanticMapper:
         # Flatten for CSV
         flat = []
         
-        # DEBUG: Inspect the first result to ensure structure
-        # if results:
-        #      print(f"\n[DEBUG] First Result keys: {results[0].keys()}")
-        #      if 'matches' in results[0]:
-        #          print(f"[DEBUG] First Result Matches: {results[0]['matches']}")
-
         for r in results:
-            matches = r.get('matches') or r.get('match') or []
-            
-            if not matches:
-                # No match case
-                flat.append({
-                    "Code": r.get('Code'), "Title": r.get('Title'), 
-                    "IFC_Target": "None", "Scenario": r.get('nbs_scenario'),
-                    "Model": r.get('Model'), "Date": r.get('Date'),
-                    "User_Score": "" # 0-3
-                })
-            else:
-                # Has matches
-                for m in matches:
-                    flat.append({
-                        "Code": r.get('Code'),
-                        "Title": r.get('Title'),
-                        "IFC_Target": m.get('ifc_target'),
-                        "Confidence": m.get('confidence'),
-                        "Rationale": m.get('rationale'),
-                        "Scenario": r.get('nbs_scenario'),
-                        "Model": r.get('Model'), "Date": r.get('Date'),
-                        "User_Score": "" # 0-3
-                    })
+            # Common metadata
+            row_dict = {
+                "Code": r.get('Code'),
+                "Title": r.get('Title'),
+                "IFC_Entity": r.get('ifc_entity', "None"),
+                "Predefined_Type": r.get('predefined_type') or "null",
+                "Previous_Guess": r.get('Previous_Guess', ""),
+                "Scenario": r.get('nbs_scenario', ""),
+                "Confidence": 1.0 if not r.get('error') else 0,
+                "Rationale": r.get('justification') or r.get('error', ""),
+                "Model": r.get('Model'),
+                "Date": r.get('Date'),
+                "User_Score": ""
+            }
+            flat.append(row_dict)
         
         df_out = pd.DataFrame(flat)
+        # Ensure correct column order
+        cols = ["Code", "Title", "IFC_Entity", "Predefined_Type", "Previous_Guess", "Scenario", "Confidence", "Rationale", "Model", "Date", "User_Score"]
+        df_out = df_out[cols]
+        
         print("\n--- DEBUG: DataFrame to Save ---")
         print(df_out.head())
         print("--------------------------------")
@@ -451,14 +588,17 @@ class SemanticMapper:
         try:
             csv_path = OUTPUT_DIR / "mapping_report.csv"
             
-            if append and csv_path.exists():
+            # Determine if we should write headers
+            is_new = not csv_path.exists() or csv_path.stat().st_size == 0
+            
+            if append and not is_new:
                 # Append mode: Write without header
                 df_out.to_csv(csv_path, mode='a', header=False, index=False)
                 print(f"Appended {len(df_out)} rows to {csv_path}")
             else:
                 # Overwrite or New file: Write with header
                 df_out.to_csv(csv_path, mode='w', header=True, index=False)
-                print(f"Saved report to {csv_path}")
+                print(f"Saved report with headers to {csv_path}")
                 
         except Exception as e:
             print(f"Error saving CSV: {e}")
@@ -474,6 +614,8 @@ async def main():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output file (Default: Append)")
     parser.add_argument("--rematch", action="store_true", help="Rematch items even if they exist in output (Default: Skip)")
     parser.add_argument("--refine", action="store_true", help="Only process items scored 0 or 1 in User_Score")
+    parser.add_argument("--ifcLimit", type=str, help="Restrict search to descendants of this IFC class (e.g. 'IfcProduct')")
+    parser.add_argument("--prefix", type=str, help="Uniclass prefix (e.g., EF_20)")
     args = parser.parse_args()
     
     if args.use_ollama:
@@ -492,8 +634,18 @@ async def main():
         model_name = args.model
 
     mapper = SemanticMapper(client, model_name=model_name)
+    if args.ifcLimit:
+        mapper.user_ifc_limit = args.ifcLimit
+        print(f"Restricting search to hierarchy: {args.ifcLimit}")
+        
     mapper.load_ifc_targets()
     mapper.load_uniclass(table_filter=args.tables)
+    
+    if args.prefix:
+        mapper.uniclass_df = mapper.uniclass_df[
+            mapper.uniclass_df['Code'].str.startswith(args.prefix, na=False)
+        ]
+        print(f"Filtered Uniclass by prefix: {args.prefix}. Remaining: {len(mapper.uniclass_df)} rows.")
     
     # Logic for Resume/Skip/Overwrite/Refine
     if args.refine:
